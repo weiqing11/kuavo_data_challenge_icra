@@ -5,7 +5,7 @@ from torch import Tensor, nn
 import torch
 from collections import deque
 from lerobot.utils.constants import ACTION, OBS_ENV_STATE, OBS_IMAGES, OBS_STATE
-from kuavo_train.wrapper.policy.diffusion.DiffusionConfigWrapper import CustomDiffusionConfigWrapper
+from kuavo_train.wrapper.policy.diffusion_new.DiffusionConfigWrapper import CustomDiffusionConfigWrapper
 from lerobot.policies.utils import (
     get_device_from_parameters,
     get_dtype_from_parameters,
@@ -13,7 +13,7 @@ from lerobot.policies.utils import (
     populate_queues,
 )
 
-from kuavo_train.wrapper.policy.diffusion.DiffusionModelWrapper import CustomDiffusionModelWrapper
+from kuavo_train.wrapper.policy.diffusion_new.DiffusionModelWrapper import CustomDiffusionModelWrapper
 import os, builtins, threading, time
 from pathlib import Path
 from typing import TypeVar
