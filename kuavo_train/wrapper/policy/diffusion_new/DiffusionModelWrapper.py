@@ -7,6 +7,8 @@ import torch.nn as nn
 from torch import Tensor
 import torchvision
 
+from transformers import AutoModel, SiglipVisionModel
+
 from lerobot.utils.constants import OBS_ENV_STATE, OBS_IMAGES, OBS_STATE
 from kuavo_train.wrapper.policy.diffusion.DiffusionConfigWrapper import CustomDiffusionConfigWrapper
 from lerobot.policies.utils import get_device_from_parameters, get_dtype_from_parameters, get_output_shape
@@ -38,6 +40,22 @@ def _make_noise_scheduler_factory(name: str, **kwargs: Dict[str, Any]):
         raise ValueError(f"Unsupported noise scheduler type {name}")
 
 
+# === Definitions for MLP Projection Module, with Signature :: [..., in_dim] --> [..., out_dim] ===
+class MLPProjector(nn.Module):
+    def __init__(self, vision_dim: int, llm_dim: int, mlp_type: str = "gelu-mlp") -> None:
+        super().__init__()
+        if mlp_type == "gelu-mlp":
+            self.projector = nn.Sequential(
+                nn.Linear(vision_dim, llm_dim, bias=True),
+                nn.GELU(),
+                nn.Linear(llm_dim, llm_dim, bias=True),
+            )
+        else:
+            raise ValueError(f"Projector with `{mlp_type = }` is not supported!")
+
+    def forward(self, img_patches: torch.Tensor) -> torch.Tensor:
+        return self.projector(img_patches)
+
 # ---------------------------
 # Feature encoders (state)
 # ---------------------------
@@ -63,6 +81,110 @@ class FeatureEncoder(nn.Module):
             return out  # (B, T, out_dim)
         else:
             raise ValueError("FeatureEncoder expects 2D or 3D tensor.")
+
+class DinoSiglipBackbone(nn.Module):
+    """
+    这是一个“虚拟”的 Backbone，它的作用是把 DINOv2+SigLIP 的序列输出
+    伪装成类似 ResNet 的 Feature Map [B, C, H, W]
+    """
+    def __init__(self, config):
+        super().__init__()
+        
+        self.dinov2_model_name = config.dinov2_model_name
+        self.siglip_model_name = config.siglip_model_name
+        self.vision_freeze = config.vision_freeze
+        
+        # 1. 加载模型
+        self.dinov2 = AutoModel.from_pretrained(self.dinov2_model_name)
+        self.siglip = SiglipVisionModel.from_pretrained(self.siglip_model_name)
+        
+        self.patch_size = self.dinov2.config.patch_size # 14
+        
+        # 2. 冻结参数
+        if self.vision_freeze:
+            for param in self.dinov2.parameters():
+                param.requires_grad = False
+            for param in self.siglip.parameters():
+                param.requires_grad = False
+            self.dinov2.eval()
+            self.siglip.eval()
+
+    def forward(self, x):
+        # x: [B, 3, H, W]
+        B, C, H, W = x.shape
+        
+        # 1. 前向传播
+        # 注意：这里我们不需要 torch.no_grad()，因为如果是 get_output_shape 调用，
+        # 外部会有 inference_mode；如果是训练调用，我们要保留梯度链（虽然 backbone 冻结了）
+        dinov2_feat = self.dinov2(x).last_hidden_state
+        siglip_feat = self.siglip(x).last_hidden_state
+        
+        # 2. 对齐序列 (去 CLS)
+        if dinov2_feat.shape[1] == siglip_feat.shape[1] + 1:
+            dinov2_feat = dinov2_feat[:, 1:, :]
+            
+        # 3. 拼接
+        # x_seq: [B, N, D_total]
+        x_seq = torch.cat([dinov2_feat, siglip_feat], dim=-1)
+        
+        # 4. 序列 -> 网格
+        # 根据当前输入 H, W 动态计算网格大小
+        grid_h = H // self.patch_size
+        grid_w = W // self.patch_size
+        
+        # 检查 Patch 数量是否对得上 (B, H*W, D)
+        # 如果对不上（比如 SigLIP 有 padding），这里会报错，这正好帮我们发现问题
+        # View: [B, N, D] -> [B, grid_h, grid_w, D]
+        # Permute: [B, grid_h, grid_w, D] -> [B, D, grid_h, grid_w]
+        x_spatial = x_seq.view(B, grid_h, grid_w, -1).permute(0, 3, 1, 2)
+        
+        return x_spatial
+
+
+class DinoSiglipRGBEncoder(nn.Module):
+    def __init__(self, config: CustomDiffusionConfigWrapper):
+        super().__init__()
+        
+        # 1. 初始化我们封装好的 Backbone
+        # 现在 self.backbone 的行为和 ResNet 一模一样了：输入图，输出 feature map
+        self.backbone = DinoSiglipBackbone(config)
+        
+        # 2. 准备 Dummy Input 用于计算形状
+        images_shape = next(iter(config.image_features.values())).shape
+        # 处理可能的 resize/crop 逻辑来确定输入大小
+        if config.resize_shape is not None:
+            dummy_shape_h_w = config.resize_shape
+        elif config.crop_shape is not None:
+            if isinstance(list(config.crop_shape)[0], (list, tuple)):
+                (x_start, x_end), (y_start, y_end) = config.crop_shape
+                dummy_shape_h_w = (x_end - x_start, y_end - y_start)
+            else:
+                dummy_shape_h_w = config.crop_shape
+        else:
+            dummy_shape_h_w = images_shape[1:]
+            
+        dummy_shape = (1, images_shape[0], *dummy_shape_h_w)
+        
+        # 3. 【完美复用】自动计算输出形状
+        # 这里的 feature_map_shape 将会自动算出 [1920, 16, 16] (假设 224输入)
+        # 即使你以后换了 patch size 或者输入尺寸，这里都不用改代码
+        feature_map_shape = get_output_shape(self.backbone, dummy_shape)[1:]
+        
+        # 4. 初始化 SpatialSoftmax
+        self.pool = SpatialSoftmax(feature_map_shape, num_kp=config.spatial_softmax_num_keypoints)
+        
+        # 5. 投影层
+        self.feature_dim = config.spatial_softmax_num_keypoints * 2
+        self.out = nn.Linear(self.feature_dim, self.feature_dim)
+        self.relu = nn.ReLU()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # 逻辑变得非常简单清爽
+        x = self.backbone(x)      # 输出 [B, 1920, 16, 16]
+        x = torch.flatten(self.pool(x), start_dim=1) # 输出 [B, num_kp*2]
+        x = self.relu(self.out(x))
+        return x
+
 
 class ResnetRgbEncoder(nn.Module):
     def __init__(self, config: CustomDiffusionConfigWrapper):
@@ -163,6 +285,8 @@ class DiffusionRgbEncoder(nn.Module):
         self.config = config
         if "resnet" in config.vision_backbone:
             self.model = ResnetRgbEncoder(config)
+        elif "dinov2" in config.vision_backbone and "siglip" in config.vision_backbone:
+            self.model = DinoSiglipRGBEncoder(config)
         else:
             raise ValueError(f"Unknown vision backbone: {config.vision_backbone}")
         self.feature_dim = self.model.feature_dim
