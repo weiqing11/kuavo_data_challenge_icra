@@ -16,6 +16,7 @@ from huggingface_hub import HfApi, ModelCard, ModelCardData, hf_hub_download
 from huggingface_hub.constants import SAFETENSORS_SINGLE_FILE
 from huggingface_hub.errors import HfHubHTTPError
 from lerobot.optim.optimizers import AdamConfig,AdamWConfig
+from logger import logger
 
 T = TypeVar("T", bound="CustomDiffusionConfigWrapper")
 
@@ -23,6 +24,13 @@ T = TypeVar("T", bound="CustomDiffusionConfigWrapper")
 @dataclass
 class CustomDiffusionConfigWrapper(DiffusionConfig):
     custom: Dict[str, Any] = field(default_factory=dict)
+
+    # ====================在这里添加！====================
+    # 必须显式声明类型，Hydra 才能把 yaml 里的值传进来
+    dinov2_model_name: str = None
+    siglip_model_name: str = None
+    vision_freeze: bool = True
+    # ==================================================
 
     def __post_init__(self):
         vision_backbone = self.vision_backbone
@@ -170,7 +178,7 @@ class CustomDiffusionConfigWrapper(DiffusionConfig):
     
     def get_optimizer_preset(self):
         if self.use_unet:
-            print("~~~~~~~~~~~~~~~Use Adam~~~~~~~~~~~~~~~~")
+            logger.info("~~~~~~~~~~~~~~~Use Adam~~~~~~~~~~~~~~~~")
             return AdamConfig(
                 lr=self.optimizer_lr,
                 betas=self.optimizer_betas,
@@ -178,7 +186,7 @@ class CustomDiffusionConfigWrapper(DiffusionConfig):
                 weight_decay=self.optimizer_weight_decay,
             )
         else:
-            print("~~~~~~~~~~~~~~~Use AdamW~~~~~~~~~~~~~~~~")
+            logger.info("~~~~~~~~~~~~~~~Use AdamW~~~~~~~~~~~~~~~~")
             return AdamWConfig(
                 lr=self.optimizer_lr,
                 betas=self.optimizer_betas,

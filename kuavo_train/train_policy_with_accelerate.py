@@ -38,6 +38,7 @@ from lerobot.processor import ProcessorStep, NormalizerProcessorStep
 from lerobot.processor.core import TransitionKey
 from lerobot.configs.types import PipelineFeatureType, PolicyFeature
 
+from logger import logger, log_box, Progress
 
 def build_augmenter(cfg):
     """Since operations such as cropping and resizing in LeRobot are implemented at the model level 
@@ -193,10 +194,10 @@ def insert_before_normalizer(pipeline, new_step):
     for i, step in enumerate(pipeline.steps):
         if isinstance(step, NormalizerProcessorStep):
             pipeline.steps.insert(i, new_step)
-            print(f"Inserted {new_step.__class__.__name__} before NormalizerProcessorStep", {i})
+            logger.info(f"Inserted {new_step.__class__.__name__} before NormalizerProcessorStep at index {i}")
             return new_step
     pipeline.steps.append(new_step)
-    print(f"No NormalizerProcessorStep found, appended {new_step.__class__.__name__} at the end")
+    logger.info(f"No NormalizerProcessorStep found, appended {new_step.__class__.__name__} at the end")
     return new_step
 
 def remove_aug_step(pipeline, step_to_remove):
@@ -205,9 +206,9 @@ def remove_aug_step(pipeline, step_to_remove):
     """
     if step_to_remove in pipeline.steps:
         pipeline.steps.remove(step_to_remove)
-        print(f"Removed {step_to_remove.__class__.__name__}")
+        logger.info(f"Removed {step_to_remove.__class__.__name__}")
     else:
-        print(f"Step {step_to_remove.__class__.__name__} not found in pipeline")
+        logger.warning(f"Step {step_to_remove.__class__.__name__} not found in pipeline")
 
 @hydra.main(config_path="../configs/policy/", config_name="diffusion_config", version_base=None)
 def main(cfg: DictConfig):
@@ -244,6 +245,7 @@ def main(cfg: DictConfig):
 
     # instantiate the policy
     policy_cfg = build_policy_config(cfg, input_features, output_features)
+    logger.info(f"policy_cfg: {policy_cfg}")
     # Build policy
     policy = build_policy(cfg.policy_name, policy_cfg)
     accelerator.wait_for_everyone()
@@ -255,15 +257,45 @@ def main(cfg: DictConfig):
     optimizer, lr_scheduler = build_optimizer_and_scheduler(policy, cfg, dataset_metadata.info["total_frames"], accelerator)
 
     # print only in main process
-    accelerator.print("\n---policy_cfg", policy_cfg)
-    accelerator.print(f"\n---Input features: {input_features}")
-    accelerator.print(f"\n---Output features: {output_features}")
-    accelerator.print(f"\n---camera_keys:", dataset_metadata.camera_keys)
-    accelerator.print(f"\n---Original dataset features:", dataset_metadata.features) 
+    training_info = {
+        "Policy Name": cfg.policy_name,
+        "Batch Size": f"{cfg.training.batch_size} (Global: {cfg.training.batch_size * accelerator.num_processes})",
+        "Accumulation Steps": cfg.training.accumulation_steps,
+        "Max Epochs": cfg.training.max_epoch,
+        "Num Workers": cfg.training.num_workers,
+        "Device": str(device),
+        "Output Dir": str(output_directory) if output_directory else "N/A (Sub-process)",
+        "Mixed Precision": accelerator.mixed_precision,
+    }
+    log_box("Training Configuration", training_info, icon="⚙️")
 
+    # 准备数据集特征摘要
+    def simplify_feats(feats):
+        return [f"{k} ({v.shape})" for k, v in feats.items()]
+
+    dataset_info = {
+        "Repo ID": cfg.repoid,
+        "Input Features": simplify_feats(input_features),
+        "Output Features": simplify_feats(output_features),
+        "Camera Keys": dataset_metadata.camera_keys,
+        "Total Frames": dataset_metadata.info["total_frames"],
+        "FPS": dataset_metadata.fps
+    }
+    log_box("Dataset Information", dataset_info, icon="💾")
+
+    # 打印模型参数量
     num_total_params = sum(p.numel() for p in policy.parameters())
     num_learnable_params = sum(p.numel() for p in policy.parameters() if p.requires_grad)
-    accelerator.print(f"num_learnable_params={num_learnable_params}", f"num_total_params={num_total_params}")
+    
+    model_stats = {
+        "Total Parameters": f"{num_total_params:,}",
+        "Learnable Params": f"{num_learnable_params:,}",
+        "Frozen Params": f"{num_total_params - num_learnable_params:,}",
+        "Learnable Ratio": f"{(num_learnable_params / num_total_params) * 100:.2f}%"
+    }
+    # 根据是否冻结显示不同的图标
+    status_icon = "❄️" if num_learnable_params < num_total_params else "🔥"
+    log_box("Model Statistics", model_stats, icon=status_icon)
 
 
     # Build dataset and dataloader
@@ -318,7 +350,7 @@ def main(cfg: DictConfig):
     # # ===== Resume logic (perfect resume for AMP & RNG) =====
     if cfg.training.resume and cfg.training.resume_timestamp:
         resume_path = Path(cfg.training.output_directory) / cfg.training.resume_timestamp
-        accelerator.print("Resuming from:", resume_path)
+        logger.info(f"🔄 Resuming from: {resume_path}")
         try:
             # Load state
             accelerator.load_state(resume_path / "epochlatest")
@@ -327,11 +359,12 @@ def main(cfg: DictConfig):
                 steps = latest_training_state["steps"]
                 start_epoch = latest_training_state["epoch"]
                 best_loss = latest_training_state["best_loss"]
-                accelerator.print(f"Resumed training from epoch {start_epoch}, step {steps}, best_loss {best_loss}")
+                logger.info(f"✅ Resumed training from epoch {start_epoch}, step {steps}, best_loss {best_loss}")
         except Exception as e:
-            accelerator.print("Failed to load checkpoint:", e, " Starting training from scratch.")
+            logger.error(f"❌ Failed to load checkpoint: {e}")
+            logger.warning("🔄 Starting training from scratch.")
     else:
-        accelerator.print("Training from scratch!")
+        logger.info("🚀 Training from scratch!")
 
     
     # Training loop
@@ -339,10 +372,11 @@ def main(cfg: DictConfig):
         policy.train()
 
         # Use tqdm only on main process
-        if accelerator.is_main_process:
-            epoch_bar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{cfg.training.max_epoch}")
-        else:
-            epoch_bar = dataloader
+        epoch_bar = Progress(
+            dataloader, 
+            desc=f"Epoch {epoch+1}/{cfg.training.max_epoch}",
+            disable=not accelerator.is_main_process
+        )
 
         total_loss = 0.0
         batch_count = 0
@@ -361,9 +395,10 @@ def main(cfg: DictConfig):
                     lr_scheduler.step()
                     if accelerator.is_main_process:
                         if steps % cfg.training.log_freq == 0:
+                            current_lr = lr_scheduler.get_last_lr()[0]
                             writer.add_scalar("train/loss", loss.item(), steps)
-                            writer.add_scalar("train/lr", lr_scheduler.get_last_lr()[0], steps)
-                            epoch_bar.set_postfix(loss=f"{loss.item():.3f}", step=steps, lr=lr_scheduler.get_last_lr()[0])
+                            writer.add_scalar("train/lr", current_lr, steps)
+                            epoch_bar.set_postfix(loss=loss.item(), lr=current_lr)
                     steps += 1
                     batch_count += 1
                     total_loss += accelerator.gather(loss).mean().item()
@@ -385,7 +420,7 @@ def main(cfg: DictConfig):
                 unwrapped_policy.save_pretrained(output_directory / f"epoch{epoch+1}")
 
                 # save latest epoch training state based on accelerator save_state
-            accelerator.print("!!!!!!Saving latest epoch training state...,DON'T CTRL+C EXIT!!!!!!")
+            logger.warning("💾 Saving latest epoch training state... DON'T CTRL+C EXIT!!!!!!")
             accelerator.save_state(output_directory / "epochlatest")
             training_state = {
                 "epoch": epoch+1, 
@@ -393,7 +428,7 @@ def main(cfg: DictConfig):
                 "best_loss": best_loss
             }
             torch.save(training_state, output_directory / "training_latest_state.pth")
-            accelerator.print(f"Epoch {epoch+1} completed. Avg Loss: {total_loss:.4f}. Best Loss: {best_loss:.4f}")
+            logger.info(f"🎉 Epoch {epoch+1} completed. Avg Loss: {total_loss:.4f}. Best Loss: {best_loss:.4f}")
         accelerator.wait_for_everyone()
 
     accelerator.wait_for_everyone()

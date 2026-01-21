@@ -6,11 +6,13 @@ import torch
 import torch.nn as nn
 from torch import Tensor
 import torchvision
+import torch.nn.functional as F
 
 from transformers import AutoModel, SiglipVisionModel
+from logger import logger, log_box
 
 from lerobot.utils.constants import OBS_ENV_STATE, OBS_IMAGES, OBS_STATE
-from kuavo_train.wrapper.policy.diffusion.DiffusionConfigWrapper import CustomDiffusionConfigWrapper
+from kuavo_train.wrapper.policy.diffusion_new.DiffusionConfigWrapper import CustomDiffusionConfigWrapper
 from lerobot.policies.utils import get_device_from_parameters, get_dtype_from_parameters, get_output_shape
 from lerobot.policies.diffusion.modeling_diffusion import (
     _make_noise_scheduler,
@@ -19,14 +21,13 @@ from lerobot.policies.diffusion.modeling_diffusion import (
     SpatialSoftmax,
     DiffusionModel,
 )
-from kuavo_train.wrapper.policy.diffusion.transformer_diffusion import TransformerForDiffusion
+from kuavo_train.wrapper.policy.diffusion_new.transformer_diffusion import TransformerForDiffusion
 
 # diffusers scheduler classes (factory expects these names)
 from diffusers.schedulers.scheduling_ddim import DDIMScheduler
 from diffusers.schedulers.scheduling_ddpm import DDPMScheduler
 from diffusers import StableDiffusion3Pipeline
 OBS_DEPTH = "observation.depth"
-
 
 # ---------------------------
 # Helper: safe scheduler factory
@@ -84,105 +85,232 @@ class FeatureEncoder(nn.Module):
 
 class DinoSiglipBackbone(nn.Module):
     """
-    这是一个“虚拟”的 Backbone，它的作用是把 DINOv2+SigLIP 的序列输出
-    伪装成类似 ResNet 的 Feature Map [B, C, H, W]
+    DINOv2 + SigLIP 双塔视觉 Backbone。
+    功能：
+    1. 并行提取特征。
+    2. 处理不同的 Patch Size 和输入分辨率（自动插值）。
+    3. 输出类似 ResNet 的 [B, C, H, W] 特征图。
     """
     def __init__(self, config):
         super().__init__()
         
         self.dinov2_model_name = config.dinov2_model_name
         self.siglip_model_name = config.siglip_model_name
-        self.vision_freeze = config.vision_freeze
-        
+        self.vision_freeze = getattr(config, "vision_freeze", True)
+
         # 1. 加载模型
-        self.dinov2 = AutoModel.from_pretrained(self.dinov2_model_name)
-        self.siglip = SiglipVisionModel.from_pretrained(self.siglip_model_name)
+        try:
+            self.dinov2 = AutoModel.from_pretrained(self.dinov2_model_name)
+            self.siglip = SiglipVisionModel.from_pretrained(self.siglip_model_name)
+        except Exception as e:
+            logger.error(f"❌ Failed to load models. Check internet or cache.")
+            raise e
         
-        self.patch_size = self.dinov2.config.patch_size # 14
-        
+        # 获取各自的 Patch Size
+        self.dino_p = self.dinov2.config.patch_size
+        self.siglip_p = self.siglip.config.patch_size
+
         # 2. 冻结参数
         if self.vision_freeze:
-            for param in self.dinov2.parameters():
-                param.requires_grad = False
-            for param in self.siglip.parameters():
-                param.requires_grad = False
+            self.dinov2.requires_grad_(False)
+            self.siglip.requires_grad_(False)
             self.dinov2.eval()
             self.siglip.eval()
+        else:
+            self.dinov2.train()
+            self.siglip.train()
+        
+        # 计算参数量
+        total_params = sum(p.numel() for p in self.parameters())
+        train_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
+        
+        status_icon = "🥶" if self.vision_freeze else "🔥"
+        status_text = "FROZEN" if self.vision_freeze else "TRAINING"
+
+        summary_dict = {
+            "DINOv2 Model": f"{self.dinov2_model_name} (Patch: {self.dino_p})",
+            "SigLIP Model": f"{self.siglip_model_name} (Patch: {self.siglip_p})",
+            "Backbone Status": f"{status_icon} {status_text}",
+            "Trainable Params": f"{train_params:,}", # 自动添加千分位逗号
+            "Total Params": f"{total_params:,}",
+            "Fusion Strategy": "Concat + Auto-Interpolate"
+        }
+        
+        log_box("Vision Backbone Summary", summary_dict, icon="🤖")
+
+    def _process_feature_map(self, feat, H, W, patch_size, model_name):
+        """
+        内部辅助函数：处理 CLS Token 并将序列还原为网格
+        """
+        B, N, D = feat.shape
+        grid_h, grid_w = H // patch_size, W // patch_size
+        expected_patches = grid_h * grid_w
+
+        # 1. 检查并移除 CLS Token
+        # 如果序列长度比网格多1，说明有CLS token
+        if N == expected_patches + 1:
+            feat = feat[:, 1:, :]
+            N -= 1
+        
+        # 2. 严格的形状检查 (Safety Check)
+        if N != expected_patches:
+            raise ValueError(f"Shape Mismatch in {model_name}: {N} vs {expected_patches}")
+
+        # 3. Reshape & Permute
+        # [B, N, D] -> [B, h, w, D] -> [B, D, h, w]
+        grid = feat.view(B, grid_h, grid_w, D).permute(0, 3, 1, 2)
+        return grid
 
     def forward(self, x):
         # x: [B, 3, H, W]
+        if x.dim() != 4:
+            raise ValueError(f"Expected input shape [B, 3, H, W], got {x.shape}")
+            
         B, C, H, W = x.shape
         
+        # -----------------------------------------------------------
         # 1. 前向传播
-        # 注意：这里我们不需要 torch.no_grad()，因为如果是 get_output_shape 调用，
-        # 外部会有 inference_mode；如果是训练调用，我们要保留梯度链（虽然 backbone 冻结了）
-        dinov2_feat = self.dinov2(x).last_hidden_state
-        siglip_feat = self.siglip(x).last_hidden_state
+        # -----------------------------------------------------------
+        # 根据是否冻结决定是否使用 no_grad，节省显存
+        context = torch.no_grad() if self.vision_freeze else torch.enable_grad()
         
-        # 2. 对齐序列 (去 CLS)
-        if dinov2_feat.shape[1] == siglip_feat.shape[1] + 1:
-            dinov2_feat = dinov2_feat[:, 1:, :]
+        with context:
+            # DINOv2
+            dinov2_feat = self.dinov2(x).last_hidden_state
             
-        # 3. 拼接
-        # x_seq: [B, N, D_total]
-        x_seq = torch.cat([dinov2_feat, siglip_feat], dim=-1)
+            # SigLIP (必须开启 interpolate_pos_encoding)
+            siglip_feat = self.siglip(x, interpolate_pos_encoding=True).last_hidden_state
+
+        # -----------------------------------------------------------
+        # 2. 还原为网格 (Grid)
+        # -----------------------------------------------------------
         
-        # 4. 序列 -> 网格
-        # 根据当前输入 H, W 动态计算网格大小
-        grid_h = H // self.patch_size
-        grid_w = W // self.patch_size
+        # 处理 DINOv2
+        dino_grid = self._process_feature_map(dinov2_feat, H, W, self.dino_p, "DINOv2")
         
-        # 检查 Patch 数量是否对得上 (B, H*W, D)
-        # 如果对不上（比如 SigLIP 有 padding），这里会报错，这正好帮我们发现问题
-        # View: [B, N, D] -> [B, grid_h, grid_w, D]
-        # Permute: [B, grid_h, grid_w, D] -> [B, D, grid_h, grid_w]
-        x_spatial = x_seq.view(B, grid_h, grid_w, -1).permute(0, 3, 1, 2)
-        
-        return x_spatial
+
+        # 处理 SigLIP
+        siglip_grid = self._process_feature_map(siglip_feat, H, W, self.siglip_p, "SigLIP")
+
+        return dino_grid.contiguous(), siglip_grid.contiguous()
 
 
 class DinoSiglipRGBEncoder(nn.Module):
-    def __init__(self, config: CustomDiffusionConfigWrapper):
+    def __init__(self, config):
         super().__init__()
         
-        # 1. 初始化我们封装好的 Backbone
-        # 现在 self.backbone 的行为和 ResNet 一模一样了：输入图，输出 feature map
-        self.backbone = DinoSiglipBackbone(config)
+        # ----------------------------------------------------------------
+        # 1. 初始化 Backbone
+        # ----------------------------------------------------------------
+        try:
+            self.backbone = DinoSiglipBackbone(config)
+        except Exception as e:
+            logger.error("❌ Failed to initialize DinoSiglipBackbone inside RGBEncoder.")
+            raise e
+
+        # ----------------------------------------------------------------
+        # 2. 确定输入图片分辨率 (Dummy Input Shape)
+        # ----------------------------------------------------------------
+        # 安全地获取图像通道数和原始尺寸
+        if not hasattr(config, "image_features") or not config.image_features:
+             raise ValueError("❌ Config missing 'image_features' or it is empty.")
         
-        # 2. 准备 Dummy Input 用于计算形状
-        images_shape = next(iter(config.image_features.values())).shape
-        # 处理可能的 resize/crop 逻辑来确定输入大小
+        # 获取第一个图像特征的形状 (C, H, W)
+        first_img_shape = next(iter(config.image_features.values())).shape
+        input_c = first_img_shape[0]
+
+        # 解析最终输入到网络的分辨率 (优先级: Resize > Crop > Original)
+        resolution_source = "Original"
         if config.resize_shape is not None:
-            dummy_shape_h_w = config.resize_shape
+            dummy_h, dummy_w = config.resize_shape
+            resolution_source = f"Resize ({dummy_h}, {dummy_w})"
         elif config.crop_shape is not None:
             if isinstance(list(config.crop_shape)[0], (list, tuple)):
                 (x_start, x_end), (y_start, y_end) = config.crop_shape
-                dummy_shape_h_w = (x_end - x_start, y_end - y_start)
+                dummy_h = x_end - x_start
+                dummy_w = y_end - y_start
             else:
-                dummy_shape_h_w = config.crop_shape
+                dummy_h, dummy_w = config.crop_shape
+            resolution_source = f"Crop ({dummy_h}, {dummy_w})"
         else:
-            dummy_shape_h_w = images_shape[1:]
+            dummy_h, dummy_w = first_img_shape[1:]
+
+        if input_c != 3:
+            logger.warning(f"⚠️ Input channels is {input_c}, but DINO/SigLIP usually expect 3 (RGB). Check your config.")
+
+        # ----------------------------------------------------------------
+        # 3. 自动计算 Backbone 输出形状
+        # ----------------------------------------------------------------
+        dummy_input = torch.zeros(1, input_c, dummy_h, dummy_w)
+        
+        try:
+            dino_out, siglip_out = self.backbone(dummy_input)
+
+            dino_shape = list(dino_out.shape[1:])   # [C1, H1, W1]
+            siglip_shape = list(siglip_out.shape[1:]) # [C2, H2, W2]
+    
+            grid_info = f"DINO:{dino_shape[1]}x{dino_shape[2]} | SigLIP:{siglip_shape[1]}x{siglip_shape[2]}"
             
-        dummy_shape = (1, images_shape[0], *dummy_shape_h_w)
-        
-        # 3. 【完美复用】自动计算输出形状
-        # 这里的 feature_map_shape 将会自动算出 [1920, 16, 16] (假设 224输入)
-        # 即使你以后换了 patch size 或者输入尺寸，这里都不用改代码
-        feature_map_shape = get_output_shape(self.backbone, dummy_shape)[1:]
-        
+        except RuntimeError as e:
+            logger.error(f"❌ Error verifying backbone with dummy input shape {dummy_input.shape}.")
+            logger.error(f"   Usually means input resolution is too small or patch size mismatch.")
+            raise e
+
+        # ----------------------------------------------------------------
         # 4. 初始化 SpatialSoftmax
-        self.pool = SpatialSoftmax(feature_map_shape, num_kp=config.spatial_softmax_num_keypoints)
+        # ----------------------------------------------------------------
+        self.num_kp = config.spatial_softmax_num_keypoints
         
+        try:
+            self.pool_dino = SpatialSoftmax(dino_shape, num_kp=self.num_kp)
+            self.pool_siglip = SpatialSoftmax(siglip_shape, num_kp=self.num_kp)
+        except Exception as e:
+            logger.error(f"❌ Failed to init SpatialSoftmax.")
+            raise e
+        
+        # ----------------------------------------------------------------
         # 5. 投影层
-        self.feature_dim = config.spatial_softmax_num_keypoints * 2
-        self.out = nn.Linear(self.feature_dim, self.feature_dim)
+        # ----------------------------------------------------------------
+        # dinov2 pool + siglip pool
+        self.raw_feature_dim = (self.num_kp * 2) * 2
+        # for diffusion
+        self.feature_dim = self.num_kp * 2
+
+        self.out = nn.Linear(self.raw_feature_dim, self.feature_dim)
         self.relu = nn.ReLU()
+        
+        summary_dict = {
+            "Fusion Type": "Late Fusion -> Projection",
+            "Backbone Grids": grid_info,
+            "Raw Concat Dim": f"{self.raw_feature_dim} (DINO+SigLIP)",
+            "Projected Dim": f"{self.feature_dim} (Compatible Output)",
+            "Keypoints": self.num_kp
+        }
+        
+        log_box("RGB Encoder Configuration", summary_dict, icon="👁️")
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # 逻辑变得非常简单清爽
-        x = self.backbone(x)      # 输出 [B, 1920, 16, 16]
-        x = torch.flatten(self.pool(x), start_dim=1) # 输出 [B, num_kp*2]
+        # 简单的维度检查
+        if x.ndim != 4:
+             raise ValueError(f"Expected 4D input [B, C, H, W], got {x.shape}")
+
+        # 1. 提取特征图 [B, C, H, W]
+        dino_feat, siglip_feat = self.backbone(x)      
+        
+        # 2. 空间软池化 -> 坐标 [B, num_kp, 2]
+        dino_kp = self.pool_dino(dino_feat)
+        siglip_kp = self.pool_siglip(siglip_feat)
+
+        # 3. 展平 坐标 [B, num_kp, 2] -> Flatten [B, num_kp*2]
+        dino_flat = torch.flatten(dino_kp, start_dim=1)   
+        siglip_flat = torch.flatten(siglip_kp, start_dim=1) 
+        
+        # 4. 拼接
+        x = torch.cat([dino_flat, siglip_flat], dim=1) # [B, feature_dim]
+
+        # 5. 线性投影 [B, feature_dim]
         x = self.relu(self.out(x))
+        
         return x
 
 

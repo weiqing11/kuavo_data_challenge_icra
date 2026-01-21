@@ -32,6 +32,8 @@ class CustomDiffusionConfigWrapper(DiffusionConfig):
         super().__post_init__()
         self.noise_scheduler_type = noise_scheduler
         self.vision_backbone = vision_backbone
+        self.dinov2_model_name = None
+        self.siglip_model_name = None
 
         default_map = {
             "VISUAL": NormalizationMode.MEAN_STD,

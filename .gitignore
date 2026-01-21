@@ -218,3 +218,6 @@ ana.py
 error.txt
 obs.png
 datasets/
+*.mp4
+*.ply
+/zyh_tmp
