@@ -9,7 +9,7 @@ import torchvision
 import torch.nn.functional as F
 
 from transformers import AutoModel, SiglipVisionModel
-from logger import logger, log_box
+from kuavo_train.logger import logger, log_box
 
 from lerobot.utils.constants import OBS_ENV_STATE, OBS_IMAGES, OBS_STATE
 from kuavo_train.wrapper.policy.diffusion_new.DiffusionConfigWrapper import CustomDiffusionConfigWrapper
@@ -22,6 +22,7 @@ from lerobot.policies.diffusion.modeling_diffusion import (
     DiffusionModel,
 )
 from kuavo_train.wrapper.policy.diffusion_new.transformer_diffusion import TransformerForDiffusion
+from kuavo_train.wrapper.policy.diffusion_new.DFormerv2 import DFormerv2_S, DFormerv2_B, DFormerv2_L
 
 # diffusers scheduler classes (factory expects these names)
 from diffusers.schedulers.scheduling_ddim import DDIMScheduler
@@ -82,6 +83,7 @@ class FeatureEncoder(nn.Module):
             return out  # (B, T, out_dim)
         else:
             raise ValueError("FeatureEncoder expects 2D or 3D tensor.")
+
 
 class DinoSiglipBackbone(nn.Module):
     """
@@ -282,6 +284,7 @@ class DinoSiglipRGBEncoder(nn.Module):
         summary_dict = {
             "Fusion Type": "Late Fusion -> Projection",
             "Backbone Grids": grid_info,
+            "resolution source": resolution_source,
             "Raw Concat Dim": f"{self.raw_feature_dim} (DINO+SigLIP)",
             "Projected Dim": f"{self.feature_dim} (Compatible Output)",
             "Keypoints": self.num_kp
@@ -312,6 +315,129 @@ class DinoSiglipRGBEncoder(nn.Module):
         x = self.relu(self.out(x))
         
         return x
+
+
+class DFomerRGBDBackbone(nn.Module):
+    def __init__(self, config):
+        """
+        初始化 DFormer RGB-D backbone
+        
+        Args:
+            model_size (str): 模型规格，可选 'small', 'base', 'large'
+            pretrained_path (str, optional): 预训练权重路径 (.pth). 默认为 None.
+            freeze_backbone (bool): 是否冻结骨干网络参数 (用于微调下游任务). 默认为 False.
+        """
+        super().__init__()
+        model_name = config.vision_backbone_rgbd
+        pretrained_path = config.DFormer_path
+        vision_freeze = config.vision_freeze
+        self.model_size = model_name.split("_")[-1]
+        
+        # 1. 配置映射 (用于实例化和日志展示)
+        # ---------------------------------------------------------
+        configs = {
+            'small': {'fn': DFormerv2_S, 'dims': [64, 128, 256, 512], 'desc': 'Small (High Speed)'},
+            'base':  {'fn': DFormerv2_B, 'dims': [80, 160, 320, 512], 'desc': 'Base (Balanced)'},
+            'large': {'fn': DFormerv2_L, 'dims': [112, 224, 448, 640], 'desc': 'Large (High Perf)'},
+        }
+        
+        if self.model_size not in configs:
+            logger.error(f"❌ Invalid model size: {self.model_size}")
+            raise ValueError(f"Choose from {list(configs.keys())}")
+            
+        cfg = configs[self.model_size]
+        self.out_channels = cfg['dims']
+
+        # 2. 实例化 Backbone
+        # ---------------------------------------------------------
+        logger.info(f"🏗️  Building DFormer architecture: {Colors.CYAN}{cfg['desc']}{Colors.RESET}")
+        self.backbone = cfg['fn']()
+        
+        # 计算参数量
+        total_params = sum(p.numel() for p in self.backbone.parameters())
+        param_str = f"{total_params / 1e6:.2f} M"
+
+        # 3. 加载权重
+        # ---------------------------------------------------------
+        if pretrained_path:
+            try:
+                self.backbone.load_pretrained(pretrained_path)
+            except Exception as e:
+                logger.error(f"Failed to load weights: {e}")
+
+        # 4. 冻结参数
+        # ---------------------------------------------------------
+        freeze_status = f"{Colors.RED}No (Trainable){Colors.RESET}"
+        if vision_freeze:
+            self._freeze_params()
+            freeze_status = f"{Colors.CYAN}Yes (Frozen ❄️){Colors.RESET}"
+
+        # 5. 打印 info
+        # ---------------------------------------------------------
+        info_dict = {
+            "Architecture": f"DFormer-v2 {self.model_size.title()}",
+            "Out Channels": str(self.out_channels),
+            "Total Params": param_str,
+            "Backbone Freeze": freeze_status,
+            "Input Mode": "RGB + Depth/Edge"
+        }
+        
+        log_box("DFormer RGBD Encoder Setup", info_dict, icon="🧠")
+
+    def _freeze_params(self):
+        """冻结 backbone 所有参数"""
+        for param in self.backbone.parameters():
+            param.requires_grad = False
+
+    def forward(self, x, x_depth):
+        """
+        Args:
+            x (Tensor): RGB 图像 [B, 3, H, W]
+            x_depth (Tensor): 深度图/边缘图 [B, 1, H, W]
+            
+        Returns:
+            list[Tensor]: 多尺度特征列表
+                - Stage 1: [B, C1, H/4, W/4]
+                - Stage 2: [B, C2, H/8, W/8]
+                - Stage 3: [B, C3, H/16, W/16]
+                - Stage 4: [B, C4, H/32, W/32]
+        """
+        # 直接调用 DFormerv2 的 forward
+        features = self.backbone(x, x_depth)
+        
+        # DFormerv2 返回的是 tuple，通常转为 list 方便后续操作
+        return list(features)
+
+    def get_out_channels(self):
+        """辅助函数：让 Decoder 知道每一层的通道数"""
+        return self.out_channels
+
+
+class DFomerRGBDEncoder(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+
+        # 1. 初始化 Backbone
+        try:
+            self.backbone = DFomerRGBDBackbone(config)
+        except Exception as e:
+            logger.error("❌ Failed to initialize DFormer inside RGBDEncoder.")
+            raise e
+        
+        # 2. 获取 Backbone 输出通道数
+        # Base版: [80, 160, 320, 512]
+        channels_list = self.backbone.get_out_channels()
+        self.use_layer_idx = -1
+        in_channels = channels_list[-1]
+        
+        # 3. 投影层 (Projection)
+        # 作用：将 Backbone 的通道数 (如 512) 对齐到 DiT 的维度 (如 768)
+        # 使用 1x1 卷积比 Linear 更适合保留空间信息
+        self.projector = nn.Sequential(
+            nn.Conv2d(in_channels, dit_hidden_dim, kernel_size=1),
+            nn.GroupNorm(32, dit_hidden_dim), # 归一化有助于训练稳定
+            nn.SiLU() # DiT 常用的激活函数
+        )
 
 
 class ResnetRgbEncoder(nn.Module):

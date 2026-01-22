@@ -28,7 +28,7 @@ training:
     ema_power: 0.75  # This parameter can be used if the EMA (Equation of Mobility) moving exponential average method is employed.
     # However, current testing shows that using EMA causes performance degradation, so it is no longer supported in the code.
 
-    batch_size: 64  # Batch size. Adjust as needed.
+    batch_size: 16  # Batch size. Adjust as needed.
     num_workers: 8  # dataloader's num_workers. Adjust as needed per your computer's performance. Setting it too high might lock up your computer
     drop_last: False  # Whether to drop the last incomplete batch
 
@@ -119,9 +119,13 @@ policy:
     # Model hyperparameters adjustments
     # vision_backbone: resnet18
     vision_backbone: "dinov2+siglip"
+    vision_backbone_rgbd: "DFormerv2_small"
+
     dinov2_model_name: "facebook/dinov2-small"
     siglip_model_name: "google/siglip2-base-patch16-224"
-    vision_freeze: True  # 是否冻结模型参数
+    DFormer_path: None
+
+    vision_freeze: False  # 是否冻结模型参数
     spatial_softmax_num_keypoints: 64
     use_separate_rgb_encoder_per_camera: False
 

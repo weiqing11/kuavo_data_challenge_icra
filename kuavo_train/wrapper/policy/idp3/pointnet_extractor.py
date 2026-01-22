@@ -200,7 +200,7 @@ class IDP3Encoder(nn.Module):  # noqa: N801
     ):
         super().__init__()
         self.state_key = "observation.state"
-        self.point_cloud_key = "observation.pointcloud"
+        self.point_cloud_key = "observation.point_cloud"
         self.n_output_channels = pointcloud_encoder_cfg.out_channels
 
         self.point_cloud_shape = observation_space[self.point_cloud_key]
@@ -243,6 +243,9 @@ class IDP3Encoder(nn.Module):  # noqa: N801
     def forward(self, observations: Dict) -> torch.Tensor:
         points = observations[self.point_cloud_key]
         assert len(points.shape) == 3, f"point cloud shape: {points.shape}, length should be 3"
+        # Only keep XYZ; datasets may provide XYZRGB (6 channels).
+        if points.shape[-1] >= 3:
+            points = points[..., :3]
 
         # points = torch.transpose(points, 1, 2)   # B * 3 * N
         # points: B * 3 * (N + sum(Ni))

@@ -16,7 +16,7 @@ from huggingface_hub import HfApi, ModelCard, ModelCardData, hf_hub_download
 from huggingface_hub.constants import SAFETENSORS_SINGLE_FILE
 from huggingface_hub.errors import HfHubHTTPError
 from lerobot.optim.optimizers import AdamConfig,AdamWConfig
-from logger import logger
+from kuavo_train.logger import logger
 
 T = TypeVar("T", bound="CustomDiffusionConfigWrapper")
 
@@ -27,8 +27,10 @@ class CustomDiffusionConfigWrapper(DiffusionConfig):
 
     # ====================在这里添加！====================
     # 必须显式声明类型，Hydra 才能把 yaml 里的值传进来
+    vision_backbone_rgbd: str = None
     dinov2_model_name: str = None
     siglip_model_name: str = None
+    DFormer_path: str = None
     vision_freeze: bool = True
     # ==================================================
 

@@ -10,7 +10,7 @@ import numpy
 import torch
 from tqdm import tqdm
 
-from kuavo_train.wrapper.policy.diffusion.DiffusionPolicyWrapper import CustomDiffusionPolicyWrapper
+from kuavo_train.wrapper.policy.diffusion_new.DiffusionPolicyWrapper import CustomDiffusionPolicyWrapper
 from lerobot.utils.random_utils import set_seed
 import datetime
 import hydra

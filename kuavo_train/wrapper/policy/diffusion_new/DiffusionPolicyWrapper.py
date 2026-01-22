@@ -12,7 +12,7 @@ from lerobot.policies.utils import (
     get_output_shape,
     populate_queues,
 )
-
+from kuavo_train.logger import logger
 from kuavo_train.wrapper.policy.diffusion_new.DiffusionModelWrapper import CustomDiffusionModelWrapper
 import os, builtins, threading, time
 from pathlib import Path

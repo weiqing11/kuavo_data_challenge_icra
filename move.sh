@@ -1,0 +1,1 @@
+rsync -avzP -e 'ssh -p 925' /home/wushihan/data/Codes/kuavo_data_challenge_icra/outputs/train robot@121.48.163.241:/home/robot/liangweiqing/code/kuavo_data_challenge_icra/outputs

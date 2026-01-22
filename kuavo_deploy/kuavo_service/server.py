@@ -24,7 +24,7 @@ import zmq
 import numpy as np
 from configs.deploy.config_inference import load_inference_config
 import torch
-from kuavo_train.wrapper.policy.diffusion.DiffusionPolicyWrapper import CustomDiffusionPolicyWrapper
+from kuavo_train.wrapper.policy.diffusion_new.DiffusionPolicyWrapper import CustomDiffusionPolicyWrapper
 
 class TorchSerializer:
     @staticmethod

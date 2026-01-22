@@ -33,7 +33,6 @@ from torch import Tensor, nn
 
 from kuavo_train.wrapper.policy.idp3.configuration_idp3 import IDP3Config
 from kuavo_train.wrapper.policy.idp3.pointnet_extractor import IDP3Encoder
-from kuavo_train.wrapper.policy.normalize import Normalize, Unnormalize
 from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.policies.utils import (
     get_device_from_parameters,
@@ -69,15 +68,9 @@ class IDP3Policy(PreTrainedPolicy):
         extracted_features = {
             key: config.input_features[key] for key in keys_to_extract if key in config.input_features
         }
-        self.normalize_inputs = Normalize(extracted_features, config.normalization_mapping, dataset_stats)
-        # self.normalize_inputs = Normalize(config.input_features, config.normalization_mapping, dataset_stats)
-
-        self.normalize_targets = Normalize(
-            config.output_features, config.normalization_mapping, dataset_stats
-        )
-        self.unnormalize_outputs = Unnormalize(
-            config.output_features, config.normalization_mapping, dataset_stats
-        )
+        self.normalize_inputs = self._identity
+        self.normalize_targets = self._identity
+        self.unnormalize_outputs = self._identity
 
         # queues are populated during rollout of the policy, they contain the n latest observations, actions contained in action_queue
         self._queues = None
@@ -85,6 +78,10 @@ class IDP3Policy(PreTrainedPolicy):
         self.diffusion = IDP3Model(config)
 
         self.reset()
+
+    @staticmethod
+    def _identity(batch: dict[str, Tensor]) -> dict[str, Tensor]:
+        return batch
 
     def get_optim_params(self) -> dict:
         # 返回模型的参数
@@ -94,13 +91,36 @@ class IDP3Policy(PreTrainedPolicy):
         """Clear observation and action queues. Should be called on `env.reset()`"""
         self._queues = {
             "observation.state": deque(maxlen=self.config.n_obs_steps),
-            "observation.pointcloud": deque(maxlen=self.config.n_obs_steps),
+            "observation.point_cloud": deque(maxlen=self.config.n_obs_steps),
         }
         if self.config.image_features:
             self._queues["observation.images"] = deque(maxlen=self.config.n_obs_steps)
         if self.config.env_state_feature:
             self._queues["observation.environment_state"] = deque(maxlen=self.config.n_obs_steps)
         self.action_queue = deque(maxlen=self.config.n_action_steps)
+
+    @torch.no_grad
+    def predict_action_chunk(self, batch: dict[str, Tensor]) -> Tensor:
+        """Predict actions for the given batch of observations.
+        
+        Args:
+            batch: A dictionary containing observation tensors. 
+                   Expected shapes should include the temporal dimension (batch_size, n_obs_steps, ...).
+        Returns:
+            Tensor: The predicted action chunk (batch_size, horizon, action_dim).
+        """
+        batch = self.normalize_inputs(batch)
+        
+        # HACK: normalize the finger states with the control range
+        # 复用 select_action 中的逻辑
+        if "observation.state" in batch:
+            # 避免原地修改影响外部
+            batch["observation.state"] = batch["observation.state"].clone()
+            batch["observation.state"][:, :, -12:] /= 10.3
+            
+        actions = self.diffusion.generate_actions(batch)
+        actions = self.unnormalize_outputs({"action": actions})["action"]
+        return actions
 
     @torch.no_grad
     def select_action(self, batch: dict[str, Tensor]) -> Tensor:
@@ -142,7 +162,7 @@ class IDP3Policy(PreTrainedPolicy):
 
         action = self.action_queue.popleft()
         self._queues["observation.state"].popleft()
-        self._queues["observation.pointcloud"].popleft()
+        self._queues["observation.point_cloud"].popleft()
         return action
 
     def forward(self, batch: dict[str, Tensor]) -> tuple[Tensor, None]:
@@ -201,6 +221,32 @@ class IDP3Model(nn.Module):
         else:
             self.num_inference_steps = config.num_inference_steps
 
+    def _prepare_point_cloud(self, point_cloud: Tensor) -> Tensor:
+        """Reshape point clouds to (B * T, N, 3) supporting both flattened and structured layouts."""
+        if point_cloud.dim() == 4:
+            # Shape: (B, T, N, C)
+            b, t, n, c = point_cloud.shape
+            return point_cloud.reshape(b * t, n, c)[..., :3]
+
+        if point_cloud.dim() == 3:
+            # Shape: (B, T, N*C)
+            b, t, d = point_cloud.shape
+            num_points = self.config.pointcloud_encoder_cfg.num_points
+            if d % num_points == 0:
+                channels = d // num_points
+                return point_cloud.reshape(b * t, num_points, channels)[..., :3]
+
+            if d % 3 == 0:
+                return point_cloud.reshape(b * t, d // 3, 3)
+
+            raise ValueError(
+                "observation.point_cloud last dimension must be divisible by num_points or 3 when flattened (XYZ per point)."
+            )
+
+        raise ValueError(
+            f"Unsupported observation.point_cloud shape {point_cloud.shape}. Expected (B, T, N, C) or (B, T, N*C)."
+        )
+
     # ========= inference  ============
     def conditional_sample(
         self, batch_size: int, global_cond: Tensor | None = None, generator: torch.Generator | None = None
@@ -240,19 +286,14 @@ class IDP3Model(nn.Module):
                 AND/OR
             "observation.environment_state": (B, environment_dim)
 
-            "observation.pointcloud": (B, n_obs_steps, num_points * 3)
+            "observation.point_cloud": (B, n_obs_steps, num_points * 3)
                     }
         """
         batch_size, n_obs_steps = batch["observation.state"].shape[:2]
         assert n_obs_steps == self.config.n_obs_steps
 
-        # Encode pointcloud features and concatenate them all together along with the state vector using mutli-stage pointnet encoder.
-        batch["observation.pointcloud"] = batch["observation.pointcloud"].reshape(
-            batch["observation.pointcloud"].shape[0], batch["observation.pointcloud"].shape[1], -1, 3
-        )
-        batch["observation.pointcloud"] = batch["observation.pointcloud"].reshape(
-            -1, *batch["observation.pointcloud"].shape[2:]
-        )
+        # Encode pointcloud features and concatenate them with the state vector using multi-stage pointnet encoder.
+        batch["observation.point_cloud"] = self._prepare_point_cloud(batch["observation.point_cloud"])
         batch["observation.state"] = batch["observation.state"].reshape(
             -1, *batch["observation.state"].shape[2:]
         )
@@ -280,7 +321,7 @@ class IDP3Model(nn.Module):
                 AND/OR
             "observation.environment_state": (B, environment_dim)
 
-            "observation.pointcloud": (B, n_obs_steps, num_points * 3)
+            "observation.point_cloud": (B, n_obs_steps, num_points * 3)
 
             "action": (B, horizon, action_dim)
             "action_is_pad": (B, horizon)
@@ -288,10 +329,7 @@ class IDP3Model(nn.Module):
         """
         # Input validation.
         assert set(batch).issuperset({"observation.state", "action", "action_is_pad"})
-        assert "observation.pointcloud" in batch
-        batch["observation.pointcloud"] = batch["observation.pointcloud"].reshape(
-            batch["observation.pointcloud"].shape[0], batch["observation.pointcloud"].shape[1], -1, 3
-        )
+        assert "observation.point_cloud" in batch
         n_obs_steps = batch["observation.state"].shape[1]
         horizon = batch["action"].shape[1]
         batch_size = batch["observation.state"].shape[0]
@@ -299,9 +337,7 @@ class IDP3Model(nn.Module):
         assert n_obs_steps == self.config.n_obs_steps
 
         # Encode point cloud features.
-        batch["observation.pointcloud"] = batch["observation.pointcloud"].reshape(
-            -1, *batch["observation.pointcloud"].shape[2:]
-        )
+        batch["observation.point_cloud"] = self._prepare_point_cloud(batch["observation.point_cloud"])
         batch["observation.state"] = batch["observation.state"].reshape(
             -1, *batch["observation.state"].shape[2:]
         )

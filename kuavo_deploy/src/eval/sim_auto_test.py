@@ -37,7 +37,7 @@ import numpy
 import torch
 from tqdm import tqdm
 
-from kuavo_train.wrapper.policy.diffusion.DiffusionPolicyWrapper import CustomDiffusionPolicyWrapper
+from kuavo_train.wrapper.policy.diffusion_new.DiffusionPolicyWrapper import CustomDiffusionPolicyWrapper
 from kuavo_train.wrapper.policy.act.ACTPolicyWrapper import CustomACTPolicyWrapper
 from lerobot.policies.act.modeling_act import ACTPolicy
 from lerobot.utils.random_utils import set_seed
