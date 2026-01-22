@@ -182,7 +182,7 @@ class IDP3Config(PreTrainedConfig):
         """Input validation (not exhaustive)."""
         # Add derived observation dictionary
         self.obs_dict = {
-            "observation.pointcloud": [self.pointcloud_encoder_cfg.num_points, 3],
+            "observation.point_cloud": [self.pointcloud_encoder_cfg.num_points, 3],
             "observation.state": [self.pointcloud_encoder_cfg.state_dim],
         }
 

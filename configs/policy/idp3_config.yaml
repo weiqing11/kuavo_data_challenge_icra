@@ -1,0 +1,116 @@
+hydra:
+  run:
+    dir: ./outputs/train_hydra_save/singlerun/${now:%Y%m%d_%H%M%S}
+  sweep:
+    dir: ./outputs/train_hydra_save/multirun/${now:%Y%m%d_%H%M%S}
+    subdir: ${hydra:job.override_dirname}
+
+# Task/dataset
+task: "idp3_test"
+method: "idp3"
+timestamp: ${now:%Y%m%d_%H%M%S}
+repoid: "lerobot/${task}"
+root: "/home/wushihan/data/Codes/kuavo_data_challenge_icra/datasets/kdc_data_pcd/Task1/lerobot"
+
+training:
+  output_directory: "outputs/train/${task}/${method}"
+  seed: 42
+  max_epoch: 1
+
+  save_freq_epoch: 10
+  log_freq: 1
+  device: "cuda"
+  accumulation_steps: 1
+  ema_power: 0.75
+
+  batch_size: 32
+  num_workers: 8
+  drop_last: false
+
+  max_training_step: null
+
+  resume: false
+  resume_timestamp: ""
+
+  RGB_Augmenter:
+    enable: True
+    max_num_transforms: 1
+    random_order: True
+    tfs:
+      notransform:
+        weight: 3.0
+        type: "Identity"
+        kwargs: {}
+      brightness:
+        weight: 1.0
+        type: "ColorJitter"
+        kwargs: {brightness: [0.5, 1.5]}
+      contrast:
+        weight: 1.0
+        type: "ColorJitter"
+        kwargs: {contrast: [0.5, 1.5]}
+      saturation:
+        weight: 1.0
+        type: "ColorJitter"
+        kwargs: {saturation: [0.5, 1.5]}
+      hue:
+        weight: 1.0
+        type: "ColorJitter"
+        kwargs: {hue: [-0.05, 0.05]}
+
+policy_name: idp3
+
+policy:
+  _target_: kuavo_train.wrapper.policy.idp3.configuration_idp3.IDP3Config
+  n_obs_steps: 2
+  horizon: 16
+  n_action_steps: 15
+  drop_n_last_frames: 0
+
+  normalization_mapping:
+    VISUAL:
+      _target_: lerobot.configs.types.NormalizationMode
+      value: MEAN_STD
+    STATE:
+      _target_: lerobot.configs.types.NormalizationMode
+      value: MIN_MAX
+    ACTION:
+      _target_: lerobot.configs.types.NormalizationMode
+      value: MIN_MAX
+
+  # Point cloud encoder
+  pointcloud_encoder_cfg:
+    in_channels: 3
+    out_channels: 128
+    use_layernorm: true
+    final_norm: "layernorm"
+    normal_channel: false
+    num_points: 4096
+    state_dim: 32
+
+  # Diffusion-related
+  down_dims: [512, 1024, 2048]
+  kernel_size: 5
+  n_groups: 8
+  diffusion_step_embed_dim: 128
+  use_film_scale_modulation: true
+  noise_scheduler_type: DDIM
+  num_train_timesteps: 50
+  beta_schedule: squaredcos_cap_v2
+  beta_start: 0.0001
+  beta_end: 0.02
+  prediction_type: sample
+  clip_sample: true
+  clip_sample_range: 1.0
+  num_inference_steps: 10
+  do_mask_loss_for_padding: false
+
+  # Optimizer / scheduler
+  optimizer_lr: 0.0001
+  optimizer_betas: [0.95, 0.999]
+  optimizer_eps: 1.0e-08
+  optimizer_weight_decay: 1.0e-6
+  scheduler_name: cosine
+  scheduler_warmup_steps: 500
+
+  use_amp: false
