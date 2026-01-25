@@ -9,7 +9,7 @@ import torchvision
 import torch.nn.functional as F
 
 from transformers import AutoModel, SiglipVisionModel
-from kuavo_train.logger import logger, log_box
+from kuavo_train.logger import logger, log_box, Colors
 
 from lerobot.utils.constants import OBS_ENV_STATE, OBS_IMAGES, OBS_STATE
 from kuavo_train.wrapper.policy.diffusion_new.DiffusionConfigWrapper import CustomDiffusionConfigWrapper
@@ -317,6 +317,88 @@ class DinoSiglipRGBEncoder(nn.Module):
         return x
 
 
+class SiglipRGBEncoder(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        
+        # 1. 加载 SigLIP
+        model_name = config.siglip_model_name
+        self.siglip = SiglipVisionModel.from_pretrained(model_name)
+        
+        # 获取基础参数
+        self.patch_size = self.siglip.config.patch_size
+        self.hidden_size = self.siglip.config.hidden_size
+        
+        # 2. 冻结/解冻逻辑
+        self.vision_freeze = getattr(config, "vision_freeze", True)
+        if self.vision_freeze:
+            self.siglip.requires_grad_(False)
+            self.siglip.eval()
+        else:
+            self.siglip.train()
+
+        # 3. 解析输入分辨率 (H, W) 以初始化 SpatialSoftmax
+        # 优先级: Resize > Crop > 原始 config
+        if config.resize_shape:
+            h, w = config.resize_shape
+        elif config.crop_shape:
+            # 处理 ((x1,x2), (y1,y2)) 或 (h, w)
+            if isinstance(list(config.crop_shape)[0], (list, tuple)):
+                (x0, x1), (y0, y1) = config.crop_shape
+                h, w = x1 - x0, y1 - y0
+            else:
+                h, w = config.crop_shape
+        else:
+            # 从 image_features 获取默认形状
+            first_shape = next(iter(config.image_features.values())).shape
+            h, w = first_shape[1:]
+
+        # 计算 Feature Map 的网格大小
+        self.grid_h = h // self.patch_size
+        self.grid_w = w // self.patch_size
+        
+        # 4. 初始化 SpatialSoftmax
+        self.num_kp = config.spatial_softmax_num_keypoints
+        # feature_shape: [C, H, W]
+        self.pool = SpatialSoftmax([self.hidden_size, self.grid_h, self.grid_w], num_kp=self.num_kp)
+
+        # 5. 投影层
+        # 输入维度: keypoints * 2 (x, y 坐标)
+        # 输出维度: 128
+        self.feature_dim = self.num_kp * 2
+        
+        self.out = nn.Linear(self.feature_dim, self.feature_dim)
+        self.relu = nn.ReLU()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x shape: [B, C, H, W]
+        
+        # 1. Backbone 前向传播
+        # 如果冻结，使用 no_grad 节省显存
+        context = torch.no_grad() if self.vision_freeze else torch.enable_grad()
+        
+        with context:
+            # SigLIP 输出: [B, N, D]
+            # interpolate_pos_encoding=True 用于适应不同的输入分辨率
+            last_hidden_state = self.siglip(x, interpolate_pos_encoding=True).last_hidden_state
+
+        # 2. Reshape: [B, N, D] -> [B, D, grid_h, grid_w]
+        B, N, D = last_hidden_state.shape
+        # 注意：这里直接使用 Permute 转换维度
+        feat = last_hidden_state.view(B, self.grid_h, self.grid_w, D).permute(0, 3, 1, 2)
+
+        # 3. Spatial Softmax -> [B, num_kp, 2]
+        kp = self.pool(feat)
+
+        # 4. Flatten -> [B, num_kp * 2]
+        x = torch.flatten(kp, start_dim=1)
+
+        # 5. Projection -> [B, out_dim]
+        x = self.relu(self.out(x))
+        
+        return x
+
+
 class DFomerRGBDBackbone(nn.Module):
     def __init__(self, config):
         """
@@ -531,8 +613,6 @@ class ResnetDepthEncoder(nn.Module):
         return x
 
 
-
-
 class DiffusionRgbEncoder(nn.Module):
     def __init__(self, config: CustomDiffusionConfigWrapper):
         super().__init__()
@@ -541,6 +621,8 @@ class DiffusionRgbEncoder(nn.Module):
             self.model = ResnetRgbEncoder(config)
         elif "dinov2" in config.vision_backbone and "siglip" in config.vision_backbone:
             self.model = DinoSiglipRGBEncoder(config)
+        elif "siglip_only" in config.vision_backbone:
+            self.model = SiglipRGBEncoder(config)
         else:
             raise ValueError(f"Unknown vision backbone: {config.vision_backbone}")
         self.feature_dim = self.model.feature_dim

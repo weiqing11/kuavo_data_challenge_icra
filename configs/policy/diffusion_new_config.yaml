@@ -118,7 +118,7 @@ policy:
 
     # Model hyperparameters adjustments
     # vision_backbone: resnet18
-    vision_backbone: "dinov2+siglip"
+    vision_backbone: "siglip_only"
     vision_backbone_rgbd: "DFormerv2_small"
 
     dinov2_model_name: "facebook/dinov2-small"

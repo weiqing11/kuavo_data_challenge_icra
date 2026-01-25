@@ -20,7 +20,7 @@ from lerobot.optim.optimizers import AdamConfig
 from lerobot.optim.schedulers import DiffuserSchedulerConfig
 from lerobot.configs.policies import PreTrainedConfig
 from lerobot.configs.types import NormalizationMode
-
+from omegaconf import DictConfig, ListConfig, OmegaConf
 
 @PreTrainedConfig.register_subclass("idp3")
 @dataclass
@@ -165,13 +165,13 @@ class IDP3Config(PreTrainedConfig):
     # Add PointCloudEncoder configuration as nested dataclass
     @dataclass
     class PointCloudEncoderConfig:
-        in_channels: int = 3
+        in_channels: int = 6 # 点云中每个点的维度，3表示x,y,z坐标，6表示x,y,z,r,g,b颜色
         out_channels: int = 128
         use_layernorm: bool = True
         final_norm: str = "layernorm"
         normal_channel: bool = False
         num_points: int = 4096
-        state_dim: int = 32
+        state_dim: int = 16
 
     pointcloud_encoder_cfg: PointCloudEncoderConfig = field(default_factory=PointCloudEncoderConfig)
     image_features = None  # TODO: Perhaps treat pointcloud as an environemnt state feature would fit better with the current implementation
@@ -180,9 +180,21 @@ class IDP3Config(PreTrainedConfig):
         super().__post_init__()
 
         """Input validation (not exhaustive)."""
+
+        if self.input_features:
+            # 执行过滤：此时 filtered_features 变成了一个普通的 Python 字典
+            # 但里面的值（value）仍然是 OmegaConf 的对象（如 ListConfig）
+            filtered_features = {
+                k: v for k, v in self.input_features.items() 
+                if "image" not in k and "depth" not in k
+            }
+            # 重新封装为 OmegaConf 对象
+            # 把最外层的字典变成 DictConfig，并确保内部所有嵌套结构也都是 Config 类型
+            self.input_features = OmegaConf.create(filtered_features)
+
         # Add derived observation dictionary
         self.obs_dict = {
-            "observation.point_cloud": [self.pointcloud_encoder_cfg.num_points, 3],
+            "observation.point_cloud": [self.pointcloud_encoder_cfg.num_points, self.pointcloud_encoder_cfg.in_channels],
             "observation.state": [self.pointcloud_encoder_cfg.state_dim],
         }
 

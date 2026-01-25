@@ -568,41 +568,20 @@ class NoiseAdder_AfterNorm2:
 
 
 def resize_image(image: Tensor, target_size: tuple[int, int], image_type='rgb') -> Tensor:
-    """
-    Resize input tensor images using Resize Shortest Edge + Center Crop.
-    
-    Args:
-        image: Tensor of shape (..., C, H, W)
-        target_size: tuple (H_new, W_new), e.g., (224, 224)
-        image_type: 'rgb' or 'depth'
-    """
-    assert image_type in ['rgb', 'depth'], "image_type must be 'rgb' or 'depth'"
-    assert image.ndim >= 3, "Input tensor must have at least 3 dimensions"
-    
-    # 1. 确定插值方式 (保持你原本的正确逻辑)
-    interpolation = T.InterpolationMode.BILINEAR if image_type == 'rgb' else T.InterpolationMode.NEAREST
+    # 1. 准备参数
+    h, w = image.shape[-2:]
+    scale = min(target_size[0] / h, target_size[1] / w)
+    new_h, new_w = int(h * scale), int(w * scale)
+    interp = T.InterpolationMode.BILINEAR if image_type == 'rgb' else T.InterpolationMode.NEAREST
 
-    # 2. 定义变换组合
-    # 假设 target_size 是 (224, 224)
-    # 我们取 target_size 的较小值作为缩放基准
-    size_param = min(target_size) 
+    # 2. Resize (类接口自动处理 3D/4D/5D 维度)
+    image = T.Resize((new_h, new_w), interpolation=interp, antialias=True)(image)
+
+    # 3. Pad (算出黑边大小 -> 填充)
+    dh, dw = target_size[0] - new_h, target_size[1] - new_w
+    padding = (dw // 2, dh // 2, dw - dw // 2, dh - dh // 2) # (left, top, right, bottom)
     
-    transforms = T.Compose([
-        # 第一步：保持比例缩放。
-        # 当传入一个 int 时，T.Resize 会将【短边】缩放到这个尺寸，长边自动按比例缩放。
-        # 例：640x480 -> Resize(224) -> 298x224
-        T.Resize(size_param, interpolation=interpolation, antialias=True),
-        
-        # 第二步：中心裁剪。
-        # 强制切出目标尺寸。
-        # 例：298x224 -> CenterCrop((224, 224)) -> 224x224 (保留中间部分)
-        T.CenterCrop(target_size)
-    ])
-
-    # 3. 应用变换
-    resized = transforms(image)
-
-    return resized
+    return T.Pad(padding, fill=0)(image)
 
 
 

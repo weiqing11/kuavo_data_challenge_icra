@@ -1,5 +1,12 @@
 # Credit: https://github.com/YanjieZe/Improved-3D-Diffusion-Policy
 
+'''
+2026.1.23
+改动 支持可变点云维度输入
+这整个文件中只有IDP3Encoder会被外部调用，如果想改变点云维度，比如x,y,z变为x,y,z,r,g,b
+请在实例化IDP3Encoder时指定pc_channels，这个参数代表点云维度
+'''
+
 import logging
 from typing import Dict, List, Type
 
@@ -11,12 +18,14 @@ logger = logging.getLogger(__name__)
 
 
 def shuffle_point_numpy(point_cloud):
+    # 随机打乱点云顺序
     B, N, C = point_cloud.shape
     indices = np.random.permutation(N)
     return point_cloud[:, indices]
 
 
 def pad_point_numpy(point_cloud, num_points):
+    # 如果点的数量小于目标数量，在原点进行零填充
     B, N, C = point_cloud.shape
     if num_points > N:
         num_pad = num_points - N
@@ -27,6 +36,7 @@ def pad_point_numpy(point_cloud, num_points):
 
 
 def uniform_sampling_numpy(point_cloud, num_points):
+    # 点数对齐，如果不够就填充，过多则随机降采样
     B, N, C = point_cloud.shape
     # padd if num_points > N
     if num_points > N:
@@ -39,12 +49,14 @@ def uniform_sampling_numpy(point_cloud, num_points):
 
 
 def shuffle_point_torch(point_cloud):
+    # 随机打乱点云顺序
     B, N, C = point_cloud.shape
     indices = torch.randperm(N)
     return point_cloud[:, indices]
 
 
 def pad_point_torch(point_cloud, num_points):
+    # 填充点数量
     B, N, C = point_cloud.shape
     device = point_cloud.device
     if num_points > N:
@@ -56,6 +68,7 @@ def pad_point_torch(point_cloud, num_points):
 
 
 def uniform_sampling_torch(point_cloud, num_points):
+    # 对齐点云数量
     B, N, C = point_cloud.shape
     device = point_cloud.device
     # padd if num_points > N
@@ -77,6 +90,7 @@ def create_mlp(
     activation_fn: Type[nn.Module] = nn.ReLU,
     squash_output: bool = False,
 ) -> List[nn.Module]:
+    # 动态构建一个MLP
     """
     Create a multi layer perceptron (MLP), which is
     a collection of fully-connected layers each followed by an activation function.
@@ -121,30 +135,39 @@ def maxpool(x, dim=-1, keepdim=False):
 
 
 class MultiStagePointNetEncoder(nn.Module):
-    def __init__(self, h_dim=128, out_channels=128, num_layers=4, **kwargs):
+    def __init__(self, pc_channels=3, h_dim=128, out_channels=128, num_layers=4, **kwargs):
         super().__init__()
 
-        self.h_dim = h_dim
-        self.out_channels = out_channels
-        self.num_layers = num_layers
+        self.pc_channels = pc_channels # 点云中每个点的维度，如果是6，则代表为x,y,z,r,g,b
+        self.h_dim = h_dim # 隐藏层维度
+        self.out_channels = out_channels # 输出维度
+        self.num_layers = num_layers # 深度
 
         self.act = nn.LeakyReLU(negative_slope=0.0, inplace=False)
 
-        self.conv_in = nn.Conv1d(3, h_dim, kernel_size=1)
+        self.conv_in = nn.Conv1d(pc_channels, h_dim, kernel_size=1) # 初始映射
+
+        # self.layers存储局部特征，global存储全局特征
         self.layers, self.global_layers = nn.ModuleList(), nn.ModuleList()
+
         for i in range(self.num_layers):
             self.layers.append(nn.Conv1d(h_dim, h_dim, kernel_size=1))
             self.global_layers.append(nn.Conv1d(h_dim * 2, h_dim, kernel_size=1))
+
         self.conv_out = nn.Conv1d(h_dim * self.num_layers, out_channels, kernel_size=1)
 
     def forward(self, x):
-        x = x.transpose(1, 2)  # [B, N, 3] --> [B, 3, N]
+        x = x.transpose(1, 2)  # [B, N, 3] --> [B, 3, N] (以3维x,y,z为例)
         y = self.act(self.conv_in(x))
         feat_list = []
         for i in range(self.num_layers):
+            # 局部特征变换
             y = self.act(self.layers[i](y))
+            # 提取全局特征
             y_global = y.max(-1, keepdim=True).values
+            # 将全局特征复制 N 份，拼接到每个点的局部特征后面
             y = torch.cat([y, y_global.expand_as(y)], dim=1)
+            # 将拼接后的双倍维度压回 h_dim，并存储到列表中
             y = self.act(self.global_layers[i](y))
             feat_list.append(y)
         # cat all features
@@ -157,6 +180,7 @@ class MultiStagePointNetEncoder(nn.Module):
 
 
 class StateEncoder(nn.Module):
+    # 将环境观察值（Observation）中的“全量状态”（Full State）向量通过一个 MLP（多层感知机）编码成高维特征
     def __init__(self, observation_space: Dict, state_mlp_size=(64, 64), state_mlp_activation_fn=nn.ReLU):
         super().__init__()
         self.state_key = "full_state"
@@ -184,7 +208,7 @@ class StateEncoder(nn.Module):
     def forward(self, observations: Dict) -> torch.Tensor:
         state = observations[self.state_key]
         state_feat = self.state_mlp(state)
-        return state_feat
+        return state_feat # [Batch, output_dim]的特征向量
 
 
 class IDP3Encoder(nn.Module):  # noqa: N801
@@ -194,6 +218,7 @@ class IDP3Encoder(nn.Module):  # noqa: N801
         state_mlp_size=(64, 64),
         state_mlp_activation_fn=nn.ReLU,
         pointcloud_encoder_cfg=None,
+        pc_channels = 3,
         use_pc_color=False,
         pointnet_type="dp3_encoder",
         point_downsample=True,
@@ -211,6 +236,7 @@ class IDP3Encoder(nn.Module):  # noqa: N801
         logger.debug(f"[IDP3Encoder] point cloud shape: {self.point_cloud_shape}")
         logger.debug(f"[IDP3Encoder] state shape: {self.state_shape}")
 
+        self.pc_channels = pc_channels
         self.use_pc_color = use_pc_color
         self.pointnet_type = pointnet_type
 
@@ -221,7 +247,8 @@ class IDP3Encoder(nn.Module):  # noqa: N801
             self.point_preprocess = nn.Identity()
 
         if pointnet_type == "multi_stage_pointnet":
-            self.extractor = MultiStagePointNetEncoder(out_channels=pointcloud_encoder_cfg.out_channels)
+            self.extractor = MultiStagePointNetEncoder(pc_channels=self.pc_channels, 
+                                                       out_channels=pointcloud_encoder_cfg.out_channels)
         else:
             raise NotImplementedError(f"pointnet_type: {pointnet_type}")
 
@@ -243,9 +270,6 @@ class IDP3Encoder(nn.Module):  # noqa: N801
     def forward(self, observations: Dict) -> torch.Tensor:
         points = observations[self.point_cloud_key]
         assert len(points.shape) == 3, f"point cloud shape: {points.shape}, length should be 3"
-        # Only keep XYZ; datasets may provide XYZRGB (6 channels).
-        if points.shape[-1] >= 3:
-            points = points[..., :3]
 
         # points = torch.transpose(points, 1, 2)   # B * 3 * N
         # points: B * 3 * (N + sum(Ni))

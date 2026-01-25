@@ -68,6 +68,7 @@ class IDP3Policy(PreTrainedPolicy):
         extracted_features = {
             key: config.input_features[key] for key in keys_to_extract if key in config.input_features
         }
+
         self.normalize_inputs = self._identity
         self.normalize_targets = self._identity
         self.unnormalize_outputs = self._identity
@@ -196,6 +197,7 @@ class IDP3Model(nn.Module):
         obs_encoder = IDP3Encoder(
             observation_space=config.obs_dict,
             pointcloud_encoder_cfg=config.pointcloud_encoder_cfg,
+            pc_channels=config.PointCloudEncoderConfig.in_channels,
             use_pc_color=False,
             pointnet_type="multi_stage_pointnet",
             point_downsample=False,
@@ -221,31 +223,42 @@ class IDP3Model(nn.Module):
         else:
             self.num_inference_steps = config.num_inference_steps
 
-    def _prepare_point_cloud(self, point_cloud: Tensor) -> Tensor:
-        """Reshape point clouds to (B * T, N, 3) supporting both flattened and structured layouts."""
-        if point_cloud.dim() == 4:
-            # Shape: (B, T, N, C)
-            b, t, n, c = point_cloud.shape
-            return point_cloud.reshape(b * t, n, c)[..., :3]
-
+    def preprocess_pointcloud(self, point_cloud: Tensor, num_points: int = 4096, pc_channels: int = 3) -> Tensor:
+        """
+        将扁平化的点云数据重塑为 (B * T, N, C) 格式。
+        参数:   pointcloud: 形状为 (B, T, N*C) 的张量/形状为 (B, T, N, C) 的张量
+                num_points: 点的数量 N
+                pc_channels: 每个点的通道数 C
+        返回: 重塑后的张量，形状为 (B * T, N, C)
+        """
+        # 如果是3维则需要展平为4维
         if point_cloud.dim() == 3:
-            # Shape: (B, T, N*C)
-            b, t, d = point_cloud.shape
-            num_points = self.config.pointcloud_encoder_cfg.num_points
-            if d % num_points == 0:
-                channels = d // num_points
-                return point_cloud.reshape(b * t, num_points, channels)[..., :3]
+            batch_size, current_steps, flattened_dim = point_cloud.shape
+            # 计算输入数据的真实特征维度
+            inferred_channels = flattened_dim // num_points
+            point_cloud = point_cloud.reshape(batch_size, current_steps, num_points, inferred_channels)
+        elif point_cloud.dim() == 4:
+            inferred_channels = point_cloud.shape[-1]
+            if point_cloud.shape[2] != num_points:
+                raise ValueError(f"Input point cloud has {point_cloud.shape[2]} points, but expected {num_points}")
+        else:
+            raise ValueError(f"Expected point_cloud to have 3 or 4 dimensions, got {point_cloud.dim()}")
 
-            if d % 3 == 0:
-                return point_cloud.reshape(b * t, d // 3, 3)
+        # 截断到指定的通道数
+        if inferred_channels != pc_channels:
+            if pc_channels < inferred_channels:
+                    print(f"Warning: The provided pc_channels {pc_channels} "
+                        f"is less than inferred {inferred_channels}. "
+                        f"Auto cutting from {inferred_channels} to {pc_channels}.")
+            else:
+                # 如果预期的维度比实际拥有的还大，通常无法自动处理，建议报错
+                raise ValueError(f"Cannot upscale channels from {inferred_channels} to {pc_channels}")
+            point_cloud = point_cloud[:, :, :, :pc_channels]
 
-            raise ValueError(
-                "observation.point_cloud last dimension must be divisible by num_points or 3 when flattened (XYZ per point)."
-            )
-
-        raise ValueError(
-            f"Unsupported observation.point_cloud shape {point_cloud.shape}. Expected (B, T, N, C) or (B, T, N*C)."
-        )
+        # 合并批次与时间维度 -> (B * T, N, C_out)
+        point_cloud = point_cloud.reshape(-1, num_points, pc_channels)
+        
+        return point_cloud
 
     # ========= inference  ============
     def conditional_sample(
@@ -286,14 +299,19 @@ class IDP3Model(nn.Module):
                 AND/OR
             "observation.environment_state": (B, environment_dim)
 
-            "observation.point_cloud": (B, n_obs_steps, num_points * 3)
+            "observation.point_cloud": (B, n_obs_steps, num_points * 3/6)
                     }
         """
         batch_size, n_obs_steps = batch["observation.state"].shape[:2]
         assert n_obs_steps == self.config.n_obs_steps
 
-        # Encode pointcloud features and concatenate them with the state vector using multi-stage pointnet encoder.
-        batch["observation.point_cloud"] = self._prepare_point_cloud(batch["observation.point_cloud"])
+        # Encode pointcloud features and concatenate them all together along with the state vector using mutli-stage pointnet encoder.
+        batch["observation.point_cloud"] = self.preprocess_pointcloud(
+            batch["observation.point_cloud"],
+            num_points=self.config.PointCloudEncoderConfig.num_points,
+            pc_channels=self.config.PointCloudEncoderConfig.in_channels,
+        )
+
         batch["observation.state"] = batch["observation.state"].reshape(
             -1, *batch["observation.state"].shape[2:]
         )
@@ -330,6 +348,7 @@ class IDP3Model(nn.Module):
         # Input validation.
         assert set(batch).issuperset({"observation.state", "action", "action_is_pad"})
         assert "observation.point_cloud" in batch
+
         n_obs_steps = batch["observation.state"].shape[1]
         horizon = batch["action"].shape[1]
         batch_size = batch["observation.state"].shape[0]
@@ -337,7 +356,11 @@ class IDP3Model(nn.Module):
         assert n_obs_steps == self.config.n_obs_steps
 
         # Encode point cloud features.
-        batch["observation.point_cloud"] = self._prepare_point_cloud(batch["observation.point_cloud"])
+        batch["observation.point_cloud"] = self.preprocess_pointcloud(
+            batch["observation.point_cloud"],
+            num_points=self.config.PointCloudEncoderConfig.num_points,
+            pc_channels=self.config.PointCloudEncoderConfig.in_channels,
+        )
         batch["observation.state"] = batch["observation.state"].reshape(
             -1, *batch["observation.state"].shape[2:]
         )

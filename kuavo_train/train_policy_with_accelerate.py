@@ -139,6 +139,24 @@ def build_policy_config(cfg, input_features, output_features):
     policy_cfg.output_features = _normalize_feature_dict(policy_cfg.output_features)
     return policy_cfg
 
+def sanitize_policy_config(policy):
+    """
+    在保存前，递归地将 policy.config 中的 OmegaConf 对象转换为原生 Python 类型 (list, dict, tuple)。
+    解决 json.dump 或 draccus 无法序列化 ListConfig/DictConfig 的问题。
+    """
+    if not hasattr(policy, 'config') or policy.config is None:
+        return
+
+    # 遍历 config 的所有属性
+    for key, value in policy.config.__dict__.items():
+        if isinstance(value, (DictConfig, ListConfig)):
+            native_value = OmegaConf.to_container(value, resolve=True) 
+            if isinstance(value, ListConfig) and key in ["down_dims", "optimizer_betas"]:
+                native_value = tuple(native_value)     
+            # 写回 config
+            setattr(policy.config, key, native_value)
+            # logger.info(f"Auto-sanitized config field '{key}': {type(value)} -> {type(native_value)}")
+
 class AugmentationProcessorStep(ProcessorStep):
     def __init__(self, transform, cam_keys):
         super().__init__()
@@ -277,13 +295,14 @@ def main(cfg: DictConfig):
 
     dataset_info = {
         "Repo ID": cfg.repoid,
-        "Input Features": simplify_feats(input_features),
-        "Output Features": simplify_feats(output_features),
+        # 修改：打印实际使用的特征，而不是全部特征
+        "Input Features": simplify_feats(policy.config.input_features),
+        "Output Features": simplify_feats(policy.config.output_features),
         "Camera Keys": dataset_metadata.camera_keys,
         "Total Frames": dataset_metadata.info["total_frames"],
         "FPS": dataset_metadata.fps
     }
-    log_box("Dataset Information", dataset_info, icon="💾")
+    log_box("Dataset Information (used)", dataset_info, icon="💾")
 
     # 打印模型参数量
     num_total_params = sum(p.numel() for p in policy.parameters())
@@ -414,11 +433,13 @@ def main(cfg: DictConfig):
             if total_loss < best_loss:
                 best_loss = total_loss
                 unwrapped_policy = accelerator.unwrap_model(policy)
+                sanitize_policy_config(unwrapped_policy)
                 unwrapped_policy.save_pretrained(output_directory / "epochbest")
 
             # Save checkpoint every N epochs
             if (epoch + 1) % cfg.training.save_freq_epoch == 0:
                 unwrapped_policy = accelerator.unwrap_model(policy)
+                sanitize_policy_config(unwrapped_policy)
                 unwrapped_policy.save_pretrained(output_directory / f"epoch{epoch+1}")
 
                 # save latest epoch training state based on accelerator save_state
