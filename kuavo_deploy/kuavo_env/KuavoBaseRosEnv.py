@@ -17,6 +17,7 @@ import torch
 from torchvision.transforms.functional import to_tensor
 from kuavo_deploy.utils.obs_buffer import ObsBuffer
 from kuavo_deploy.utils.signal_controller import ControlSignalManager
+from kuavo_data.common.pcd_utils import process_pcd_task1
 
 
 log_robot = setup_logger("robot")
@@ -69,6 +70,12 @@ class KuavoBaseRosEnv(gym.Env):
         self.ratio = config_kuavo_env.ratio
         self.frame_alignment = config_kuavo_env.frame_alignment
 
+        # 新增的处理点云的信息
+        self.point_cloud_num_points = 4096
+        self.point_cloud_channels = 6
+        self.point_cloud_rgb_key = "head_cam_h"
+        self.point_cloud_depth_key = "depth_h"
+
     def _set_observation_space(self):
         limits = self.limits
         obs_low, obs_high = [], []
@@ -116,6 +123,14 @@ class KuavoBaseRosEnv(gym.Env):
             high=self.obs_high,
             dtype=np.float32,
             shape=(len(self.obs_low),)
+        )
+
+        # -------- Point cloud space --------
+        obs_spaces["observation.point_cloud"] = gym.spaces.Box(
+            low=-np.inf,
+            high=np.inf,
+            dtype=np.float32,
+            shape=(self.point_cloud_num_points, self.point_cloud_channels),
         )
 
         self.observation_space = gym.spaces.Dict(obs_spaces)
@@ -501,7 +516,28 @@ class KuavoBaseRosEnv(gym.Env):
         log_robot.info(f"STATE: contained {state_keys}, concated value: {obs['observation.state']}")
 
         obs["observation.state"] = torch.from_numpy(obs["observation.state"]).float().unsqueeze(0)
-        return obs    
+
+        # -------- Point cloud computation --------
+        # 检查 ObsBuffer 是否被修改（是否存在 raw 属性）
+        if not hasattr(self.obs_buffer, 'raw_rgb_frames') or not hasattr(self.obs_buffer, 'raw_depth_frames'):
+             raise RuntimeError("ObsBuffer is missing raw frame storage! Please update obs_buffer.py.")
+        rgb_key = self.point_cloud_rgb_key
+        depth_key = self.point_cloud_depth_key
+        # 从缓存获取数据
+        rgb_frame = self.obs_buffer.raw_rgb_frames.get(rgb_key)
+        depth_frame = self.obs_buffer.raw_depth_frames.get(depth_key)
+        if rgb_frame is None:
+            raise ValueError(f"Point Cloud Error: Raw RGB frame not found for key '{rgb_key}'. Waiting for callback?")
+        if depth_frame is None:
+            raise ValueError(f"Point Cloud Error: Raw Depth frame not found for key '{depth_key}'. Waiting for callback?")
+
+        pcd_array = process_pcd_task1(rgb_frame, depth_frame)
+        if pcd_array is None:
+             raise ValueError("Point Cloud Error: process_pcd_task1 returned None!")
+
+        obs["observation.point_cloud"] = torch.from_numpy(pcd_array).float().unsqueeze(0)
+        
+        return obs
 
     def close(self):
         """关闭环境，释放资源 Closing environment"""

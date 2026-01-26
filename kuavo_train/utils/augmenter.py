@@ -567,21 +567,41 @@ class NoiseAdder_AfterNorm2:
     
 
 
-def resize_image(image: Tensor, target_size: tuple[int, int], image_type='rgb') -> Tensor:
+def resize_image(
+    image: Tensor, 
+    target_size: tuple[int, int], 
+    image_type='rgb', 
+    mode='crop'  # 'pad' 或 'crop'
+) -> Tensor:
     # 1. 准备参数
     h, w = image.shape[-2:]
-    scale = min(target_size[0] / h, target_size[1] / w)
+    
+    if mode == 'pad':
+        # 缩放比例取最小，确保图像完全显示在框内
+        scale = min(target_size[0] / h, target_size[1] / w)
+    elif mode == 'crop':
+        # 缩放比例取最大，确保图像填满框，溢出部分待裁剪
+        scale = max(target_size[0] / h, target_size[1] / w)
+    else:
+        raise ValueError("mode 必须是 'pad' 或 'crop'")
+
     new_h, new_w = int(h * scale), int(w * scale)
     interp = T.InterpolationMode.BILINEAR if image_type == 'rgb' else T.InterpolationMode.NEAREST
 
-    # 2. Resize (类接口自动处理 3D/4D/5D 维度)
+    # 2. 执行 Resize
     image = T.Resize((new_h, new_w), interpolation=interp, antialias=True)(image)
 
-    # 3. Pad (算出黑边大小 -> 填充)
-    dh, dw = target_size[0] - new_h, target_size[1] - new_w
-    padding = (dw // 2, dh // 2, dw - dw // 2, dh - dh // 2) # (left, top, right, bottom)
+    # 3. 处理余白 (Pad) 或 溢出 (Crop)
+    if mode == 'pad':
+        dh, dw = target_size[0] - new_h, target_size[1] - new_w
+        # padding 格式: (left, top, right, bottom)
+        padding = (dw // 2, dh // 2, dw - dw // 2, dh - dh // 2)
+        return T.Pad(padding, fill=0)(image)
     
-    return T.Pad(padding, fill=0)(image)
+    else: # mode == 'crop'
+        # Center Crop: 算出中心点并切成 target_size
+        # CenterCrop 内部会自动处理坐标计算
+        return T.CenterCrop(target_size)(image)
 
 
 

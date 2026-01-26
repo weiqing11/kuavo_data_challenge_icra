@@ -180,18 +180,6 @@ class IDP3Config(PreTrainedConfig):
         super().__post_init__()
 
         """Input validation (not exhaustive)."""
-
-        if self.input_features:
-            # 执行过滤：此时 filtered_features 变成了一个普通的 Python 字典
-            # 但里面的值（value）仍然是 OmegaConf 的对象（如 ListConfig）
-            filtered_features = {
-                k: v for k, v in self.input_features.items() 
-                if "image" not in k and "depth" not in k
-            }
-            # 重新封装为 OmegaConf 对象
-            # 把最外层的字典变成 DictConfig，并确保内部所有嵌套结构也都是 Config 类型
-            self.input_features = OmegaConf.create(filtered_features)
-
         # Add derived observation dictionary
         self.obs_dict = {
             "observation.point_cloud": [self.pointcloud_encoder_cfg.num_points, self.pointcloud_encoder_cfg.in_channels],

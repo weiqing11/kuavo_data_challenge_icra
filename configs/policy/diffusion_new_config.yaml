@@ -7,7 +7,7 @@ hydra:  # Hydra config directory, for parameter checking only
 
 
 task: "Task1"  # Custom task name. If using huggingface datasets instead of local dataset, please specify, such as pusht, aloha_sim_insertion_human etc.
-method: "dino+siglip"  # Custom method name
+method: "siglip+local"  # Custom method name
 timestamp: ${now:%Y%m%d_%H%M%S}  # Auto-obtained timestamp
 # 训练时模型参数的保存目录在outputs/train/<task>/<method>/<timestamp>中
 repoid: "lerobot/${task}"  # Newer versions of lerobot require this, for lerobot reference only. Not actually used elsewhere.
@@ -21,7 +21,7 @@ training:
     seed: 42  # Data augmentation and training seed. Used for easier result reproduction
     max_epoch: 500  # Max trainign epoch, used to control learning rate controller. Related to max_training_step beneath
     
-    save_freq_epoch: 2  # Training parameter save frequency. 10 epoch per saved weights
+    save_freq_epoch: 5  # Training parameter save frequency. 10 epoch per saved weights
     log_freq: 1  # Progress bar refresh frequency. 1 = Every iteration step.
     device: "cuda" # Training device. Single GPU only by default. Systems with multiple GPU's please use CUDA_VISIBLE_DEVICES=6 as an envionment variable. cuda:6 might not work.
     accumulation_steps: 1  # Grad accumulation step

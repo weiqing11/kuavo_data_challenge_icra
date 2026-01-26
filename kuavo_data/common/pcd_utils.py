@@ -165,16 +165,18 @@ def convert_o3d_to_numpy(pcd):
     return np.hstack([points, colors]).astype(np.float32)
 
 # 任务1 点云处理流水线
-def process_pcd_task1(rgb_img, depth_img, intrinsic_matrix, save_path=None):
+def process_pcd_task1(rgb_img, depth_img):
+    intrinsic_matrix = np.array([
+        [554.25, 0.0, 320.0],
+        [0.0, 554.25, 240.0],
+        [0.0, 0.0, 1.0]
+    ])
     # 生成点云
     pcd = generate_point_cloud(rgb_img, depth_img, intrinsic_matrix, depth_scale=1000.0)
     # 清洗点云
     pcd = clean_point_cloud(pcd, task_id=1, max_dist=0.65, remove_outliers=True)
     # 统一点云数量
     pcd = resize_point_cloud_o3d(pcd, target_points=4096, method='fps')
-    # 保存点云
-    if save_path is not None:
-        save_point_cloud_o3d(pcd, save_path)
     # 返回处理后的点云
     return convert_o3d_to_numpy(pcd)
 
@@ -189,14 +191,6 @@ def test_pipeline_from_rosbag(bag_path, target_sec):
     RGB_TOPIC = "/cam_h/color/image_raw/compressed"
     DEPTH_TOPIC = "/cam_h/depth/image_raw/compressedDepth"
     SAVE_PATH = "./debug_output/test_cloud.ply"
-    
-    # 仿真环境内参 (Sim 640x480)
-    INTRINSICS = np.array([
-        [554.25, 0.0, 320.0],
-        [0.0, 554.25, 240.0],
-        [0.0, 0.0, 1.0]
-    ])
-    # ---------------------------
 
     if not os.path.exists(BAG_PATH):
         print(f"❌ 文件不存在: {BAG_PATH}")
@@ -253,7 +247,7 @@ def test_pipeline_from_rosbag(bag_path, target_sec):
     cv2.imwrite(f"{debug_dir}/test_depth_raw.png", depth_img)
     print("📷 已保存 RGB 和 Depth 图像用于调试。")
 
-    result = process_pcd_task1(rgb_img, depth_img, INTRINSICS, save_path=SAVE_PATH)
+    result = process_pcd_task1(rgb_img, depth_img)
     print(f"📊 处理后点云数据形状: {result.shape}")
 
     print("================ 测试完成 ================")

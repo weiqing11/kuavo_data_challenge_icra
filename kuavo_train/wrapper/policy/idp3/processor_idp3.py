@@ -1,30 +1,91 @@
+#!/usr/bin/env python
+
+from typing import Any
+
 import torch
-from lerobot.processor import PolicyProcessorPipeline, NormalizerProcessorStep, UnnormalizerProcessorStep
 
-def make_idp3_pre_post_processors(policy_cfg, dataset_stats=None):
+# 根据你的文件结构，这里使用相对导入
+from .configuration_idp3 import IDP3Config
+from lerobot.processor import (
+    AddBatchDimensionProcessorStep,
+    DeviceProcessorStep,
+    NormalizerProcessorStep,
+    PolicyAction,
+    PolicyProcessorPipeline,
+    RenameObservationsProcessorStep,
+    UnnormalizerProcessorStep,
+)
+from lerobot.processor.converters import policy_action_to_transition, transition_to_policy_action
+from lerobot.utils.constants import POLICY_POSTPROCESSOR_DEFAULT_NAME, POLICY_PREPROCESSOR_DEFAULT_NAME
+
+
+def make_idp3_pre_post_processors(
+    config: IDP3Config,
+    dataset_stats: dict[str, dict[str, torch.Tensor]] | None = None,
+) -> tuple[
+    PolicyProcessorPipeline[dict[str, Any], dict[str, Any]],
+    PolicyProcessorPipeline[PolicyAction, PolicyAction],
+]:
     """
-    为 IDP3 策略创建预处理器和后处理器。
-    函数名必须匹配 make_{policy_name}_pre_post_processors 格式。
+    Constructs pre-processor and post-processor pipelines for an IDP3 policy.
+
+    The pre-processing pipeline prepares the input data for the model by:
+    1. Renaming features.
+    2. Normalizing the input and output features based on dataset statistics.
+    3. Adding a batch dimension.
+    4. Moving the data to the specified device.
+
+    The post-processing pipeline handles the model's output by:
+    1. Moving the data to the CPU.
+    2. Unnormalizing the output features to their original scale.
+
+    Args:
+        config: The configuration object for the IDP3 policy,
+            containing feature definitions, normalization mappings, and device information.
+        dataset_stats: A dictionary of statistics used for normalization.
+            Defaults to None.
+
+    Returns:
+        A tuple containing the configured pre-processor and post-processor pipelines.
     """
-    # 合并所有特征定义，因为 Normalizer/Unnormalizer 需要知道所有 Key 的统计数据
-    features = {**policy_cfg.input_features, **policy_cfg.output_features}
 
-    # 1. 创建预处理器 (Preprocessor)
-    # 使用 NormalizerProcessorStep 将输入 (observation) 归一化
-    normalization_step = NormalizerProcessorStep(
-        features=features,
-        norm_map=policy_cfg.normalization_mapping,
-        stats=dataset_stats
+    # 输入预处理步骤
+    input_steps = [
+        # 如果需要重命名观察空间键值（例如将 observation.image.front 重命名为 observation.images），在这里配置
+        RenameObservationsProcessorStep(rename_map={}),
+        # 增加 Batch 维度 (C, H, W) -> (1, C, H, W)
+        AddBatchDimensionProcessorStep(),
+        # 移动数据到计算设备 (CPU/GPU)
+        DeviceProcessorStep(device=config.device),
+        # 归一化：根据 config.normalization_mapping 和 dataset_stats 对输入特征进行归一化
+        NormalizerProcessorStep(
+            features={**config.input_features, **config.output_features},
+            norm_map=config.normalization_mapping,
+            stats=dataset_stats,
+        ),
+    ]
+
+    # 输出后处理步骤
+    output_steps = [
+        # 反归一化：将模型输出的 Action 还原到原始物理空间数值
+        UnnormalizerProcessorStep(
+            features=config.output_features, 
+            norm_map=config.normalization_mapping, 
+            stats=dataset_stats
+        ),
+        # 将数据移回 CPU
+        DeviceProcessorStep(device="cpu"),
+    ]
+
+    return (
+        PolicyProcessorPipeline[dict[str, Any], dict[str, Any]](
+            steps=input_steps,
+            name=POLICY_PREPROCESSOR_DEFAULT_NAME,
+        ),
+        PolicyProcessorPipeline[PolicyAction, PolicyAction](
+            steps=output_steps,
+            name=POLICY_POSTPROCESSOR_DEFAULT_NAME,
+            to_transition=policy_action_to_transition,
+            to_output=transition_to_policy_action,
+        ),
     )
-    preprocessor = PolicyProcessorPipeline([normalization_step])
-
-    # 2. 创建后处理器 (Postprocessor)
-    # 使用 UnnormalizerProcessorStep 将输出 (action) 反归一化
-    unnormalization_step = UnnormalizerProcessorStep(
-        features=features,
-        norm_map=policy_cfg.normalization_mapping,
-        stats=dataset_stats
-    )
-    postprocessor = PolicyProcessorPipeline([unnormalization_step])
-
-    return preprocessor, postprocessor

@@ -6,7 +6,7 @@ hydra:
     subdir: ${hydra:job.override_dirname}
 
 # Task/dataset
-task: "idp3_rgb"
+task: "idp3_v2_no_rgb"
 method: "idp3"
 timestamp: ${now:%Y%m%d_%H%M%S}
 repoid: "lerobot/${task}"
@@ -24,13 +24,13 @@ training:
   ema_power: 0.75
 
   batch_size: 64
-  num_workers: 8
+  num_workers: 4
   drop_last: false
 
   max_training_step: null
 
-  resume: false
-  resume_timestamp: ""
+  resume: true
+  resume_timestamp: "/home/wushihan/data/Codes/kuavo_data_challenge_icra/outputs/train/idp3_v2_no_rgb/idp3/run_20260125_184949"
 
   RGB_Augmenter:
     enable: True
@@ -80,7 +80,7 @@ policy:
 
   # Point cloud encoder
   pointcloud_encoder_cfg:
-    in_channels: 6
+    in_channels: 3
     out_channels: 128
     use_layernorm: true
     final_norm: "layernorm"

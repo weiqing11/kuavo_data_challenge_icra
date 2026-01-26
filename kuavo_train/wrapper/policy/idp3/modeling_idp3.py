@@ -69,20 +69,12 @@ class IDP3Policy(PreTrainedPolicy):
             key: config.input_features[key] for key in keys_to_extract if key in config.input_features
         }
 
-        self.normalize_inputs = self._identity
-        self.normalize_targets = self._identity
-        self.unnormalize_outputs = self._identity
-
         # queues are populated during rollout of the policy, they contain the n latest observations, actions contained in action_queue
         self._queues = None
 
         self.diffusion = IDP3Model(config)
 
         self.reset()
-
-    @staticmethod
-    def _identity(batch: dict[str, Tensor]) -> dict[str, Tensor]:
-        return batch
 
     def get_optim_params(self) -> dict:
         # 返回模型的参数
@@ -102,25 +94,10 @@ class IDP3Policy(PreTrainedPolicy):
 
     @torch.no_grad
     def predict_action_chunk(self, batch: dict[str, Tensor]) -> Tensor:
-        """Predict actions for the given batch of observations.
-        
-        Args:
-            batch: A dictionary containing observation tensors. 
-                   Expected shapes should include the temporal dimension (batch_size, n_obs_steps, ...).
-        Returns:
-            Tensor: The predicted action chunk (batch_size, horizon, action_dim).
-        """
-        batch = self.normalize_inputs(batch)
-        
-        # HACK: normalize the finger states with the control range
-        # 复用 select_action 中的逻辑
-        if "observation.state" in batch:
-            # 避免原地修改影响外部
-            batch["observation.state"] = batch["observation.state"].clone()
-            batch["observation.state"][:, :, -12:] /= 10.3
-            
+        """Predict a chunk of actions given environment observations."""
+        batch = {k: torch.stack(list(self._queues[k]), dim=1) for k in batch if k in self._queues}
         actions = self.diffusion.generate_actions(batch)
-        actions = self.unnormalize_outputs({"action": actions})["action"]
+
         return actions
 
     @torch.no_grad
@@ -145,20 +122,12 @@ class IDP3Policy(PreTrainedPolicy):
         "horizon" may not the best name to describe what the variable actually means, because this period is
         actually measured from the first observation which (if `n_obs_steps` > 1) happened in the past.
         """
-        batch = self.normalize_inputs(batch)
         # Note: It's important that this happens after stacking the images into a single key.
         self._queues = populate_queues(self._queues, batch)
 
         if len(self.action_queue) == 0:
             # stack n latest observations from the queue
-            batch = {k: torch.stack(list(self._queues[k]), dim=1) for k in batch if k in self._queues}
-
-            # HACK: normalize the finger states with the control range
-            batch["observation.state"][:, :, -12:] /= 10.3
-            actions = self.diffusion.generate_actions(batch)
-
-            # TODO(rcadene): make above methods return output dictionary?
-            actions = self.unnormalize_outputs({"action": actions})["action"]
+            actions = self.predict_action_chunk(batch)
             self.action_queue.extend(actions.transpose(0, 1))
 
         action = self.action_queue.popleft()
@@ -168,8 +137,6 @@ class IDP3Policy(PreTrainedPolicy):
 
     def forward(self, batch: dict[str, Tensor]) -> tuple[Tensor, None]:
         """Run the batch through the model and compute the loss for training or validation."""
-        batch = self.normalize_inputs(batch)
-        batch = self.normalize_targets(batch)
         loss = self.diffusion.compute_loss(batch)
         # no output_dict so returning None
         return loss, None

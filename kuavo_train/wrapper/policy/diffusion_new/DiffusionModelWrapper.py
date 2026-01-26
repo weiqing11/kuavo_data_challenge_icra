@@ -370,6 +370,18 @@ class SiglipRGBEncoder(nn.Module):
         self.out = nn.Linear(self.feature_dim, self.feature_dim)
         self.relu = nn.ReLU()
 
+        # # 3. 投影层 (Projection Layer)
+        # # 全局模式不再需要 SpatialSoftmax，输入直接是 hidden_size
+        # # config.output_dim 是你最终希望输出给后端的特征维度 (如 512 或 1024)
+        # self.num_kp = config.spatial_softmax_num_keypoints
+        # self.feature_dim = self.num_kp * 2
+        
+        # self.projection = nn.Sequential(
+        #     nn.Linear(self.hidden_size, self.feature_dim),
+        #     nn.LayerNorm(self.feature_dim),
+        #     nn.ReLU()
+        # )
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x shape: [B, C, H, W]
         
@@ -396,6 +408,19 @@ class SiglipRGBEncoder(nn.Module):
         # 5. Projection -> [B, out_dim]
         x = self.relu(self.out(x))
         
+        # with context:
+        #     # interpolate_pos_encoding=True 允许输入不同于预训练时的分辨率
+        #     # SigLIP 会自动处理 Attention Pooling 过程
+        #     outputs = self.siglip(x, interpolate_pos_encoding=True)
+            
+        #     # 提取全局 Token [B, hidden_size]
+        #     # pooler_output 是经过 Attention Pooling 聚合后的整图表征
+        #     global_feat = outputs.pooler_output 
+
+        # # 2. 投影到目标维度
+        # # 这里的输出是一个高度压缩的语义向量
+        # x = self.projection(global_feat)
+
         return x
 
 

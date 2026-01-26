@@ -13,7 +13,8 @@ class Colors:
     DIM = "\033[2m"
     ITALIC = "\033[3m"
     UNDERLINE = "\033[4m"
-    
+    TEXT_DEFAULT = "\033[39m"
+
     # 标准色
     BLACK = "\033[30m"
     RED = "\033[31m"
@@ -64,8 +65,8 @@ class ModernFormatter(logging.Formatter):
     
     # 时间戳颜色
     TIME_CLR = Colors.BRIGHT_BLACK + Colors.ITALIC
-    SEP_CLR = Colors.DIM + Colors.WHITE
-    MSG_CLR = Colors.BRIGHT_WHITE
+    SEP_CLR = Colors.DIM + Colors.TEXT_DEFAULT
+    MSG_CLR = Colors.TEXT_DEFAULT
     
     # 徽章样式定义
     LEVEL_BADGES = {
@@ -134,9 +135,9 @@ def log_box(title, content_dict, icon="🚀"):
     # --- 样式定义 ---
     # 边框使用紫色，更有科技感
     C_BORDER = Colors.BRIGHT_MAGENTA 
-    C_TITLE = Colors.BOLD + Colors.BRIGHT_WHITE
+    C_TITLE = Colors.BOLD + Colors.TEXT_DEFAULT
     C_KEY = Colors.CYAN  # 键使用青色
-    C_VAL = Colors.BRIGHT_WHITE # 值使用亮白
+    C_VAL = Colors.TEXT_DEFAULT 
     C_ICON = Colors.RESET
     
     # 圆角字符

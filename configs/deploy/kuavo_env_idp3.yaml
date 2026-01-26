@@ -83,17 +83,17 @@ env:
 
 
 # =====================================================
-# inference config: Change here for inferencing configuration, both in sim and real-device
+# inference config: IDP3 Policy Evaluation Configuration
 # =====================================================
 inference:
   go_bag_path: /path/to/your/go.bag  # !!! Not used in simulation !!! In real-device inferencing, a rosbag path is provided for the robot to initialise properly to the correct init position. Any single rosbag from corresponding training data will do.
-  policy_type: "diffusion"  # Policy name. Supports diffusion, act
+  policy_type: "idp3"  # Policy name. Changed to idp3 for IDP3 policy evaluation
   eval_episodes: 100  # Number of evaluation episodes. 100 times default for simulator competition, for scoring purposes.
   seed: 42  # Randomisation seeding.
   start_seed: 42  # Initial seed for each episode
   device: "cuda"  # or "cpu"
-  task: "Task1"
-  method: "dino+siglip"
-  timestamp: "run_20260124_190704"
+  task: "idp3_v2_no_rgb"  # Task name - should match your training task
+  method: "idp3"  # Method name - IDP3 policy
+  timestamp: "run_20260125_184949"  # Training timestamp - Update this to your actual training run timestamp
   epoch: best  # Which epoch to use from the training weights. I.e. 50, 100, best, etc. Note:Weights will be used from outputs/train/<task>/<method>/<timestamp>/epoch<epoch> to load policy
   max_episode_steps: 200  # Max episode steps. Stops after this threshold. Increase for longer tasks.

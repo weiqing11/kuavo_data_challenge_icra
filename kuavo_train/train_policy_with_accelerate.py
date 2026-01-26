@@ -40,6 +40,14 @@ from lerobot.processor.core import TransitionKey
 from lerobot.configs.types import PipelineFeatureType, PolicyFeature
 
 from logger import logger, log_box, Progress
+# 禁用安全检查
+_original_load = torch.load
+
+def unsafe_load(*args, **kwargs):
+    kwargs['weights_only'] = False 
+    return _original_load(*args, **kwargs)
+
+torch.load = unsafe_load
 
 def build_augmenter(cfg):
     """Since operations such as cropping and resizing in LeRobot are implemented at the model level 
@@ -279,25 +287,17 @@ def main(cfg: DictConfig):
     # print only in main process
     training_info = {
         "Policy Name": cfg.policy_name,
+        "Method": cfg.method,
         "Batch Size": f"{cfg.training.batch_size} (Global: {cfg.training.batch_size * accelerator.num_processes})",
-        "Accumulation Steps": cfg.training.accumulation_steps,
         "Max Epochs": cfg.training.max_epoch,
         "Num Workers": cfg.training.num_workers,
-        "Device": str(device),
         "Output Dir": str(output_directory) if output_directory else "N/A (Sub-process)",
         "Mixed Precision": accelerator.mixed_precision,
     }
     log_box("Training Configuration", training_info, icon="⚙️")
 
-    # 准备数据集特征摘要
-    def simplify_feats(feats):
-        return [f"{k} ({v.shape})" for k, v in feats.items()]
-
     dataset_info = {
         "Repo ID": cfg.repoid,
-        # 修改：打印实际使用的特征，而不是全部特征
-        "Input Features": simplify_feats(policy.config.input_features),
-        "Output Features": simplify_feats(policy.config.output_features),
         "Camera Keys": dataset_metadata.camera_keys,
         "Total Frames": dataset_metadata.info["total_frames"],
         "FPS": dataset_metadata.fps
