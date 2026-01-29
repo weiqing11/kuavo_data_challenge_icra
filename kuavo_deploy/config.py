@@ -163,7 +163,7 @@ class ConfigInference:
     env_name: str = "Kuavo-Sim"
 
     def validate(self):
-        if self.policy_type not in ["diffusion", "act"]:
+        if self.policy_type not in ["diffusion", "act", "idp3"]:
             # 若将来支持更多策略，请在此扩展
             # Expansion room for future support for other policies
             raise ValueError(f"Unsupported policy_type '{self.policy_type}'")

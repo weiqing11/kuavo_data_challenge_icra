@@ -30,7 +30,7 @@ training:
   max_training_step: null
 
   resume: true
-  resume_timestamp: "/home/wushihan/data/Codes/kuavo_data_challenge_icra/outputs/train/idp3_v2_no_rgb/idp3/run_20260125_184949"
+  resume_timestamp: "/home/wushihan/data/Codes/kuavo_data_challenge_icra/outputs/train/idp3_v2_no_rgb/idp3/run_20260126_110144"
 
   RGB_Augmenter:
     enable: True
