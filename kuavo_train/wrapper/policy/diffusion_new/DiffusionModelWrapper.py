@@ -479,11 +479,10 @@ class DFomerRGBDEncoder(nn.Module):
         # 融合 Stage 2, 3, 4 的通道
         self.total_fused_channels = sum(channels_list[1:]) # 160 + 320 + 512 = 992
         
-        # 获取输入分辨率和 Stage 4 的网格大小 (用于 SpatialSoftmax)
-        # 假设输入 224x224，Stage 4 缩放 32 倍，得到 7x7
+        # 获取输入分辨率和 Stage 3 的网格大小 (用于 SpatialSoftmax)
         first_img_shape = next(iter(config.image_features.values())).shape
         h, w = config.resize_shape if config.resize_shape else first_img_shape[1:]
-        self.grid_h, self.grid_w = h // 32, w // 32 
+        self.grid_h, self.grid_w = h // 16, w // 16 
         
         # 3. 初始化层次化 SpatialSoftmax
         self.num_kp = config.spatial_softmax_num_keypoints
@@ -495,28 +494,24 @@ class DFomerRGBDEncoder(nn.Module):
         
         # 4. 统一输出维度
         self.feature_dim = self.num_kp * 2
-        self.out = nn.Linear(self.feature_dim, self.feature_dim)
-        self.relu = nn.ReLU()
+        self.out = nn.Sequential(
+            nn.Linear(self.feature_dim, self.feature_dim),
+            nn.ReLU()
+        )
 
     def forward(self, rgb: torch.Tensor, depth: torch.Tensor) -> torch.Tensor:
-        # Step 0: 输入形状 [B, 3, 224, 224] 和 [B, 1, 224, 224]
-        
-        # Step 1: 提取多尺度特征
-        # feats[1] (Stage 2): [B, 160, 28, 28]
-        # feats[2] (Stage 3): [B, 320, 14, 14]
-        # feats[3] (Stage 4): [B, 512, 7, 7]
         feats = self.backbone(rgb, depth)
         f2, f3, f4 = feats[1], feats[2], feats[3]
         
-        # Step 2: 空间分辨率对齐 (全部对齐到 Stage 4 的 7x7)
         target_size = (self.grid_h, self.grid_w)
-        f2_p = F.adaptive_avg_pool2d(f2, target_size) # 形状: [B, 160, 7, 7]
-        f3_p = F.adaptive_avg_pool2d(f3, target_size) # 形状: [B, 320, 7, 7]
-        # f4 已经是 [B, 512, 7, 7]
+        f2_p = F.adaptive_avg_pool2d(f2, target_size) 
+        f3_p = F.adaptive_avg_pool2d(f3, target_size) 
         
-        # Step 3: 多尺度特征拼接
-        # 形状变化: [B, 992, 7, 7] (即 160+320+512)
-        fused_map = torch.cat([f2_p, f3_p, f4], dim=1)
+        f4_aligned = F.interpolate(f4, size=target_size, mode='bilinear', align_corners=False)
+        
+        # 多尺度特征拼接
+        # 形状变化: [B, 992, H, W] (即 160+320+512)
+        fused_map = torch.cat([f2_p, f3_p, f4_aligned], dim=1)
         
         # Step 4: Spatial Softmax 提取坐标
         # 内部会进行 1x1 卷积将 992 通道投影到 num_kp
@@ -530,7 +525,7 @@ class DFomerRGBDEncoder(nn.Module):
         # Step 6: 最终投影与激活
         # 形状: [B, 128]
         # 此时输出维度完全匹配 DinoSiglipRGBEncoder.feature_dim
-        x = self.relu(self.out(x))
+        x = self.out(x)
         
         return x
 
@@ -641,6 +636,19 @@ class DiffusionRgbEncoder(nn.Module):
         self.feature_dim = self.model.feature_dim
     def forward(self, x: Tensor) -> Tensor:
         return self.model(x)
+
+
+class DiffusionRGBDEncoder(nn.Module):
+    def __init__(self, config: CustomDiffusionConfigWrapper):
+        super().__init__()
+        self.config = config
+        if "DFormer" in config.vision_backbone_rgbd:
+            self.model = DFomerRGBDEncoder(config)
+        else:
+            raise ValueError(f"Unknown RGBD backbone: {config.vision_backbone_rgbd}")
+        self.feature_dim = self.model.feature_dim
+    def forward(self, x: Tensor, x_depth: Tensor) -> Tensor:
+        return self.model(x, x_depth)
 
 
 class DiffusionDepthEncoder(nn.Module):
@@ -758,21 +766,44 @@ class CustomDiffusionModelWrapper(DiffusionModel):
             self.rgb_attn_layer = nn.MultiheadAttention(embed_dim=feat_dim, num_heads=getattr(self.config, "rgb_attn_heads", 8), batch_first=True)
 
         # ---- Depth encoders (optional) ----
-        self.depth_feat_dim = 0
+        self.depth_feat_dim = 0     
+        # 1. 检查是否开启 Depth 模块
         if getattr(self.config, "use_depth", False) and getattr(self.config, "depth_features", None):
+            self.depth_encoder_type = getattr(self.config, "depth_encoder_type", "DEPTH") # 默认为纯深度
+            
+            # 2. 根据配置决定实例化哪个类
+            if self.depth_encoder_type == "DEPTH":
+                # 对应纯深度编码器 (如 ResNet18)
+                EncoderClass = DiffusionDepthEncoder 
+            elif self.depth_encoder_type == "RGBD":
+                # 对应 RGBD 融合编码器 (如 DFormer)
+                EncoderClass = DiffusionRGBDEncoder
+            else:
+                raise ValueError(f"Unknown depth_encoder_type: {self.depth_encoder_type}")
+
             num_depth = len(self.config.depth_features)
+
+            # 3. 实例化编码器 (支持 per_camera 独立权重或共享权重)
             if getattr(self.config, "use_separate_depth_encoder_per_camera", False):
-                encs = [DiffusionDepthEncoder(config) for _ in range(num_depth)]
+                encs = [EncoderClass(config) for _ in range(num_depth)]
                 self.depth_encoder = nn.ModuleList(encs)
                 feat_dim = encs[0].feature_dim
             else:
-                self.depth_encoder = DiffusionDepthEncoder(config)
+                self.depth_encoder = EncoderClass(config)
                 feat_dim = self.depth_encoder.feature_dim
+            
+            # 4. 更新全局维度和 Attention 层
             self.depth_feat_dim = feat_dim * num_depth
             global_cond_dim += self.depth_feat_dim
-            self.depth_attn_layer = nn.MultiheadAttention(embed_dim=feat_dim, num_heads=getattr(self.config, "depth_attn_heads", 8), batch_first=True)
+            
+            # 初始化 Attention
+            self.depth_attn_layer = nn.MultiheadAttention(
+                embed_dim=feat_dim, 
+                num_heads=getattr(self.config, "depth_attn_heads", 8), 
+                batch_first=True
+            )
 
-            # RGB <-> Depth cross-attn modules
+            # 初始化多模态融合层
             self.multimodalfuse = nn.ModuleDict({
                 "rgb_q": nn.MultiheadAttention(embed_dim=feat_dim, num_heads=getattr(self.config, "multimodal_heads", 8), batch_first=True),
                 "depth_q": nn.MultiheadAttention(embed_dim=feat_dim, num_heads=getattr(self.config, "multimodal_heads", 8), batch_first=True),
@@ -866,18 +897,48 @@ class CustomDiffusionModelWrapper(DiffusionModel):
             # self-attn over tokens
             img_features = self.rgb_attn_layer(img_features, img_features, img_features)[0]  # (b*s, n, feat)
 
-        # ---------- Depth (optional) ----------
+        # ---------- Depth / RGBD (Modified) ----------
         depth_features = None
+        # 1. 检查是否开启 Depth，且数据中存在 Depth
         if getattr(self.config, "use_depth", False) and getattr(self.config, "depth_features", None) and (OBS_DEPTH in batch):
+            # 2. 判断当前模式: 'rgbd' (DFormer) 还是 'depth' (ResNet)
+            # 默认为 'depth' 以兼容旧 Config
+            encoder_mode = getattr(self, "depth_encoder_type", "DEPTH") 
+
             if getattr(self.config, "use_separate_depth_encoder_per_camera", False):
-                depths = einops.rearrange(batch[OBS_DEPTH], "b s n ... -> n (b s) ...")
-                enc_outs = [enc(d) for enc, d in zip(self.depth_encoder, depths)]
+                # === Case A: 每个摄像头独立 Encoder ===
+                # 准备 Depth 数据: [B, S, N, ...] -> [N, B*S, ...]
+                depths_by_cam = einops.rearrange(batch[OBS_DEPTH], "b s n ... -> n (b s) ...")
+                
+                if encoder_mode == "RGBD":
+                    # RGBD 模式：需要同时准备 RGB 数据，形状必须完全对齐
+                    imgs_by_cam = einops.rearrange(batch[OBS_IMAGES], "b s n ... -> n (b s) ...")
+                    # 传入 (rgb, depth)
+                    enc_outs = [enc(im, d) for enc, im, d in zip(self.depth_encoder, imgs_by_cam, depths_by_cam)]
+                else:
+                    # 纯 Depth 模式：只传 depth
+                    enc_outs = [enc(d) for enc, d in zip(self.depth_encoder, depths_by_cam)]
+                
                 dep_cat = torch.cat(enc_outs)
                 depth_features = einops.rearrange(dep_cat, "(n b s) f -> (b s) n f", b=B, s=S)
+            
             else:
-                depths = einops.rearrange(batch[OBS_DEPTH], "b s n ... -> (b s n) ...")
-                out = self.depth_encoder(depths)
+                # === Case B: 共享 Encoder ===
+                # 准备 Depth 数据: [B, S, N, ...] -> [B*S*N, ...]
+                depths_flat = einops.rearrange(batch[OBS_DEPTH], "b s n ... -> (b s n) ...")
+                
+                if encoder_mode == "RGBD":
+                    # RGBD 模式：获取 RGB 数据
+                    imgs_flat = einops.rearrange(batch[OBS_IMAGES], "b s n ... -> (b s n) ...")
+                    # 传入 (rgb, depth)
+                    out = self.depth_encoder(imgs_flat, depths_flat)
+                else:
+                    # 纯 Depth 模式
+                    out = self.depth_encoder(depths_flat)
+                
                 depth_features = einops.rearrange(out, "(b s n) f -> (b s) n f", b=B, s=S)
+
+            # 3. Apply Self-Attention
             depth_features = self.depth_attn_layer(depth_features, depth_features, depth_features)[0]  # (b*s, n, feat)
 
         # ---------- RGB <-> Depth fusion (if both exist) ----------

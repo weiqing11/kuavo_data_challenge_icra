@@ -207,17 +207,16 @@ class Progress:
         # 🎨 定制样式
         # l_bar: 左侧 (标题 + 百分比)
         # bar: 进度条本体
-        # r_bar: 右侧 (计数 + 时间 + 参数)
-        # 我们使用 ANSI 颜色注入到 bar_format 中
+        # r_bar: 右侧 (计数 + 时间 + 速度 + 参数)
         
-        # 进度条字符：使用平滑的块字符
         self.bar_format = (
-            f"{Colors.BOLD}{Colors.CYAN}{{desc}}{Colors.RESET} "  # 标题 (青色粗体)
-            f"{{percentage:3.0f}}% "                              # 百分比
-            f"{Colors.MAGENTA}{{bar}}{Colors.RESET} "             # 进度条 (紫色)
-            f"{{n_fmt}}/{{total_fmt}} "                           # 计数
-            f"[{Colors.DIM}⏱️ {{elapsed}}<{{remaining}}{Colors.RESET}" # 时间 (灰色)
-            f"{{postfix}}]"                                       # 后缀 (指标)
+            f"{Colors.BOLD}{Colors.CYAN}{{desc}}{Colors.RESET} "   # 标题
+            f"{{percentage:3.0f}}% "                               # 百分比
+            f"{Colors.BRIGHT_GREEN}{{bar}}{Colors.RESET} "         # 🟢 亮绿色进度条
+            f"{{n_fmt}}/{{total_fmt}} "                            # 计数 (例如 100/1000)
+            f"[{Colors.DIM}⏱️ {{elapsed}}<{{remaining}}"            # 时间
+            f" {Colors.RESET}|{Colors.DIM} {{rate_fmt}}{Colors.RESET}"  # ⚡️ 找回了 Step 速度 (it/s)
+            f"{{postfix}}]"                                        # 后缀 (指标)
         )
         
         self.tqdm_instance = tqdm(
@@ -226,9 +225,9 @@ class Progress:
             desc=desc,
             disable=disable,
             bar_format=self.bar_format,
-            ascii=" ▏▎▍▌▋▊▉█", # 使用平滑的 UTF-8 块字符
+            ascii=" ▏▎▍▌▋▊▉█",
             leave=True,
-            dynamic_ncols=True # 自动调整宽度
+            dynamic_ncols=True
         )
 
     def __iter__(self):
@@ -243,9 +242,8 @@ class Progress:
     def set_postfix(self, **kwargs):
         """
         覆盖原版 set_postfix，自动把 key-value 格式化得更好看
-        例如: loss=0.01 -> 📉 0.010
+        例如: loss=0.01 -> | 📉 0.010
         """
-        # 自定义映射图标
         icons = {
             "loss": "📉",
             "lr": "⚡",
@@ -272,8 +270,11 @@ class Progress:
                 
             formatted_list.append(f"{color}{icon} {val_str}{Colors.RESET}")
             
-        # 使用 set_postfix_str 避免 tqdm 自动加 ", " 和 "="
-        self.tqdm_instance.set_postfix_str("  ".join(formatted_list))
+        # 💡 修改点：如果 list 不为空，在前面加一个 " | " 作为分隔符，防止和速度粘在一起
+        if formatted_list:
+            self.tqdm_instance.set_postfix_str(" | " + " ".join(formatted_list))
+        else:
+            self.tqdm_instance.set_postfix_str("")
 
     def close(self):
         self.tqdm_instance.close()

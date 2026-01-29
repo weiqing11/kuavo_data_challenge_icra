@@ -570,11 +570,18 @@ def resize_image(
     image: Tensor, 
     target_size: tuple[int, int], 
     image_type='rgb', 
-    mode='pad'  # 'pad' 或 'crop'
+    mode='pad'  # 'pad', 'crop' 或 'none'
 ) -> Tensor:
     # 1. 准备参数
     h, w = image.shape[-2:]
+    interp = T.InterpolationMode.BILINEAR if image_type == 'rgb' else T.InterpolationMode.NEAREST
     
+    # --- 新增：直接缩放模式 (不保持比例) ---
+    if mode == 'none':
+        # 直接调用 Resize 到目标尺寸，会产生拉伸形变
+        return T.Resize(target_size, interpolation=interp, antialias=True)(image)
+    # ------------------------------------
+
     if mode == 'pad':
         # 缩放比例取最小，确保图像完全显示在框内
         scale = min(target_size[0] / h, target_size[1] / w)
@@ -582,26 +589,21 @@ def resize_image(
         # 缩放比例取最大，确保图像填满框，溢出部分待裁剪
         scale = max(target_size[0] / h, target_size[1] / w)
     else:
-        raise ValueError("mode 必须是 'pad' 或 'crop'")
+        raise ValueError("mode 必须是 'pad', 'crop' 或 'none'")
 
     new_h, new_w = int(h * scale), int(w * scale)
-    interp = T.InterpolationMode.BILINEAR if image_type == 'rgb' else T.InterpolationMode.NEAREST
 
-    # 2. 执行 Resize
+    # 2. 执行按比例的 Resize
     image = T.Resize((new_h, new_w), interpolation=interp, antialias=True)(image)
 
     # 3. 处理余白 (Pad) 或 溢出 (Crop)
     if mode == 'pad':
         dh, dw = target_size[0] - new_h, target_size[1] - new_w
-        # padding 格式: (left, top, right, bottom)
         padding = (dw // 2, dh // 2, dw - dw // 2, dh - dh // 2)
         return T.Pad(padding, fill=0)(image)
     
     else: # mode == 'crop'
-        # Center Crop: 算出中心点并切成 target_size
-        # CenterCrop 内部会自动处理坐标计算
         return T.CenterCrop(target_size)(image)
-
 
 
 def crop_image(image, target_range, random_crop=False):

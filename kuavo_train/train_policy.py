@@ -21,7 +21,8 @@ from lerobot.datasets.sampler import EpisodeAwareSampler
 from lerobot.datasets.utils import dataset_to_policy_features
 from lerobot.utils.random_utils import set_seed
 from lerobot.policies.factory import make_pre_post_processors
-from kuavo_train.wrapper.policy.diffusion.DiffusionPolicyWrapper import CustomDiffusionPolicyWrapper
+#from kuavo_train.wrapper.policy.diffusion.DiffusionPolicyWrapper import CustomDiffusionPolicyWrapper
+from kuavo_train.wrapper.policy.diffusion_new.DiffusionPolicyWrapper import CustomDiffusionPolicyWrapper
 from kuavo_train.wrapper.policy.act.ACTPolicyWrapper import CustomACTPolicyWrapper
 from kuavo_train.wrapper.dataset.LeRobotDatasetWrapper import CustomLeRobotDataset
 from kuavo_train.utils.augmenter import crop_image, resize_image, DeterministicAugmenterColor
@@ -36,6 +37,7 @@ from lerobot.processor import ProcessorStep, NormalizerProcessorStep
 from lerobot.processor.core import TransitionKey
 from lerobot.configs.types import PipelineFeatureType, PolicyFeature
 # import ipdb
+from kuavo_train.logger import Progress
 
 
 def build_augmenter(cfg):
@@ -353,8 +355,8 @@ def main(cfg: DictConfig):
             prefetch_factor=2 if cfg.training.num_workers > 0 else None,
         )
 
-        epoch_bar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{cfg.training.max_epoch}")
-
+        #epoch_bar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{cfg.training.max_epoch}")
+        epoch_bar = Progress(dataloader, desc=f"Epoch {epoch+1}/{cfg.training.max_epoch}")
         
         total_loss = 0.0
         for batch in epoch_bar:

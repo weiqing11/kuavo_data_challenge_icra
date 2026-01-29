@@ -7,11 +7,11 @@ hydra:  # Hydra config directory, for parameter checking only
 
 
 task: "Task1"  # Custom task name. If using huggingface datasets instead of local dataset, please specify, such as pusht, aloha_sim_insertion_human etc.
-method: "dino+siglip_fusion"  # Custom method name
+method: "siglip_global+DFormer"  # Custom method name
 timestamp: ${now:%Y%m%d_%H%M%S}  # Auto-obtained timestamp
 # 训练时模型参数的保存目录在outputs/train/<task>/<method>/<timestamp>中
 repoid: "lerobot/${task}"  # Newer versions of lerobot require this, for lerobot reference only. Not actually used elsewhere.
-root: "/home/wushihan/data/Codes/kuavo_data_challenge_icra/datasets/kdc_icra_26_lerobot_task1"  # Locally converted lerobot dataset directory
+root: "/home/liangweiqing/data/code/kuavo_data_challenge_icra/datasets/Task1"  # Locally converted lerobot dataset directory
 # root: null  # If using huggingface datasets instead of local dataset, please specify in task, such as pusht, aloha_sim_insertion_human.
 # Uncomment and leave that to null in that case. This will then use their cloud downloads
 
@@ -28,7 +28,7 @@ training:
     ema_power: 0.75  # This parameter can be used if the EMA (Equation of Mobility) moving exponential average method is employed.
     # However, current testing shows that using EMA causes performance degradation, so it is no longer supported in the code.
 
-    batch_size: 16  # Batch size. Adjust as needed.
+    batch_size: 4  # Batch size. Adjust as needed.
     num_workers: 8  # dataloader's num_workers. Adjust as needed per your computer's performance. Setting it too high might lock up your computer
     drop_last: False  # Whether to drop the last incomplete batch
 
@@ -118,12 +118,12 @@ policy:
 
     # Model hyperparameters adjustments
     # vision_backbone: resnet18
-    vision_backbone: "dinov2+siglip" #"siglip_only"
+    vision_backbone: "siglip_only" #"dinov2+siglip" 
     vision_backbone_rgbd: "DFormerv2_small"
 
     dinov2_model_name: "facebook/dinov2-small"
     siglip_model_name: "google/siglip2-base-patch16-224"
-    DFormer_path: None
+    DFormer_path: "/home/liangweiqing/data/models/DFormerv2_pretrained/DFormerv2/pretrained/DFormerv2_Small_pretrained.pth"
 
     vision_encoder_mode: global
     vision_freeze: False  # 是否冻结模型参数
@@ -168,11 +168,12 @@ policy:
     custom:  # Custom configs. Special adjustments based on the lerobot diffusion policy, including depth support. You may refer to related codes for details
       # support depth image
       use_depth: true
+      depth_encoder_type: "RGBD" # "DEPTH""
       depth_backbone: resnet18
       use_separate_depth_encoder_per_camera: False
 
       # resize and augmentation
-      resize_shape: [224, 224] #[210, 280]  # [224, 368]
+      resize_shape: [288, 384] #[224, 224] #[210, 280]  # [224, 368]
 
       # state encoder.
       use_state_encoder: true

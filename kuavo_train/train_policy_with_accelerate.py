@@ -24,6 +24,7 @@ from lerobot.datasets.utils import dataset_to_policy_features
 from lerobot.utils.random_utils import set_seed
 from lerobot.policies.factory import make_pre_post_processors
 from kuavo_train.wrapper.policy.diffusion_new.DiffusionPolicyWrapper import CustomDiffusionPolicyWrapper
+#from kuavo_train.wrapper.policy.diffusion.DiffusionPolicyWrapper import CustomDiffusionPolicyWrapper
 from kuavo_train.wrapper.policy.act.ACTPolicyWrapper import CustomACTPolicyWrapper
 from kuavo_train.wrapper.policy.idp3.modeling_idp3 import IDP3Policy
 from kuavo_train.wrapper.dataset.LeRobotDatasetWrapper import CustomLeRobotDataset
