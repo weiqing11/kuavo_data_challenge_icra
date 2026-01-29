@@ -121,24 +121,6 @@ class DinoSiglipBackbone(nn.Module):
         else:
             self.dinov2.train()
             self.siglip.train()
-        
-        # 计算参数量
-        total_params = sum(p.numel() for p in self.parameters())
-        train_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
-        
-        status_icon = "🥶" if self.vision_freeze else "🔥"
-        status_text = "FROZEN" if self.vision_freeze else "TRAINING"
-
-        summary_dict = {
-            "DINOv2 Model": f"{self.dinov2_model_name} (Patch: {self.dino_p})",
-            "SigLIP Model": f"{self.siglip_model_name} (Patch: {self.siglip_p})",
-            "Backbone Status": f"{status_icon} {status_text}",
-            "Trainable Params": f"{train_params:,}", # 自动添加千分位逗号
-            "Total Params": f"{total_params:,}",
-            "Fusion Strategy": "Concat + Auto-Interpolate"
-        }
-        
-        log_box("Vision Backbone Summary", summary_dict, icon="🤖")
 
     def _process_feature_map(self, feat, H, W, patch_size, model_name):
         """
@@ -188,11 +170,11 @@ class DinoSiglipBackbone(nn.Module):
         # -----------------------------------------------------------
         
         # 处理 DINOv2
-        dino_grid = self._process_feature_map(dinov2_feat, H, W, self.dino_p, "DINOv2")
+        dino_grid = self._process_feature_map(dinov2_feat, H, W, self.dino_p, self.dinov2_model_name)
         
 
         # 处理 SigLIP
-        siglip_grid = self._process_feature_map(siglip_feat, H, W, self.siglip_p, "SigLIP")
+        siglip_grid = self._process_feature_map(siglip_feat, H, W, self.siglip_p, self.siglip_model_name)
 
         return dino_grid.contiguous(), siglip_grid.contiguous()
 
@@ -201,117 +183,101 @@ class DinoSiglipRGBEncoder(nn.Module):
     def __init__(self, config):
         super().__init__()
         
-        # ----------------------------------------------------------------
         # 1. 初始化 Backbone
-        # ----------------------------------------------------------------
-        try:
-            self.backbone = DinoSiglipBackbone(config)
-        except Exception as e:
-            logger.error("❌ Failed to initialize DinoSiglipBackbone inside RGBEncoder.")
-            raise e
-
-        # ----------------------------------------------------------------
-        # 2. 确定输入图片分辨率 (Dummy Input Shape)
-        # ----------------------------------------------------------------
-        # 安全地获取图像通道数和原始尺寸
-        if not hasattr(config, "image_features") or not config.image_features:
-             raise ValueError("❌ Config missing 'image_features' or it is empty.")
+        self.backbone = DinoSiglipBackbone(config)
+        self.dino_dim = self.backbone.dinov2.config.hidden_size
+        self.siglip_dim = self.backbone.siglip.config.hidden_size
         
-        # 获取第一个图像特征的形状 (C, H, W)
-        first_img_shape = next(iter(config.image_features.values())).shape
-        input_c = first_img_shape[0]
+        # 2. 维度投影
+        self.fusion_dim = getattr(config, "vision_fusion_dim", 256)
+        self.proj_dino = nn.Conv2d(self.dino_dim, self.fusion_dim, kernel_size=1)
+        self.proj_siglip = nn.Conv2d(self.siglip_dim, self.fusion_dim, kernel_size=1)
 
-        # 解析最终输入到网络的分辨率 (优先级: Resize > Crop > Original)
-        resolution_source = "Original"
-        if config.resize_shape is not None:
-            dummy_h, dummy_w = config.resize_shape
-            resolution_source = f"Resize ({dummy_h}, {dummy_w})"
-        elif config.crop_shape is not None:
-            if isinstance(list(config.crop_shape)[0], (list, tuple)):
-                (x_start, x_end), (y_start, y_end) = config.crop_shape
-                dummy_h = x_end - x_start
-                dummy_w = y_end - y_start
-            else:
-                dummy_h, dummy_w = config.crop_shape
-            resolution_source = f"Crop ({dummy_h}, {dummy_w})"
-        else:
-            dummy_h, dummy_w = first_img_shape[1:]
-
-        if input_c != 3:
-            logger.warning(f"⚠️ Input channels is {input_c}, but DINO/SigLIP usually expect 3 (RGB). Check your config.")
-
-        # ----------------------------------------------------------------
-        # 3. 自动计算 Backbone 输出形状
-        # ----------------------------------------------------------------
-        dummy_input = torch.zeros(1, input_c, dummy_h, dummy_w)
+        # 3. 双向 Cross-Attention
+        # 路径 A: SigLIP 引导 DINO (语义找几何)
+        self.attn_s2d = nn.MultiheadAttention(
+            embed_dim=self.fusion_dim,
+            num_heads=getattr(config, "vision_attn_heads", 8),
+            batch_first=True
+        )
         
-        try:
-            dino_out, siglip_out = self.backbone(dummy_input)
+        # 路径 B: DINO 引导 SigLIP (几何找语义)
+        self.attn_d2s = nn.MultiheadAttention(
+            embed_dim=self.fusion_dim,
+            num_heads=getattr(config, "vision_attn_heads", 8),
+            batch_first=True
+        )
 
-            dino_shape = list(dino_out.shape[1:])   # [C1, H1, W1]
-            siglip_shape = list(siglip_out.shape[1:]) # [C2, H2, W2]
-    
-            grid_info = f"DINO:{dino_shape[1]}x{dino_shape[2]} | SigLIP:{siglip_shape[1]}x{siglip_shape[2]}"
-            
-        except RuntimeError as e:
-            logger.error(f"❌ Error verifying backbone with dummy input shape {dummy_input.shape}.")
-            logger.error(f"   Usually means input resolution is too small or patch size mismatch.")
-            raise e
+        # 4. 融合后的处理层 (简单的 LayerNorm 增加稳定性)
+        self.norm = nn.LayerNorm(self.fusion_dim)
 
-        # ----------------------------------------------------------------
-        # 4. 初始化 SpatialSoftmax
-        # ----------------------------------------------------------------
-        self.num_kp = config.spatial_softmax_num_keypoints
-        
-        try:
-            self.pool_dino = SpatialSoftmax(dino_shape, num_kp=self.num_kp)
-            self.pool_siglip = SpatialSoftmax(siglip_shape, num_kp=self.num_kp)
-        except Exception as e:
-            logger.error(f"❌ Failed to init SpatialSoftmax.")
-            raise e
-        
-        # ----------------------------------------------------------------
-        # 5. 投影层
-        # ----------------------------------------------------------------
-        # dinov2 pool + siglip pool
-        self.raw_feature_dim = (self.num_kp * 2) * 2
-        # for diffusion
+        # 5. 自动计算网格并初始化池化层
+        self._setup_spatial_softmax(config)
+
+        # 6. 输出投影
         self.feature_dim = self.num_kp * 2
-
-        self.out = nn.Linear(self.raw_feature_dim, self.feature_dim)
+        self.out = nn.Linear(self.feature_dim, self.feature_dim)
         self.relu = nn.ReLU()
-        
-        summary_dict = {
-            "Fusion Type": "Late Fusion -> Projection",
-            "Backbone Grids": grid_info,
-            "resolution source": resolution_source,
-            "Raw Concat Dim": f"{self.raw_feature_dim} (DINO+SigLIP)",
-            "Projected Dim": f"{self.feature_dim} (Compatible Output)",
-            "Keypoints": self.num_kp
-        }
-        
-        log_box("RGB Encoder Configuration", summary_dict, icon="👁️")
+
+        dino_params = sum(p.numel() for p in self.backbone.dinov2.parameters())
+        siglip_params = sum(p.numel() for p in self.backbone.siglip.parameters())
+        total_params = sum(p.numel() for p in self.parameters())
+        trainable_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
+
+        log_box("RGB Encoder Config", {
+            "DINO Model": self.backbone.dinov2_model_name,
+            "SigLIP Model": self.backbone.siglip_model_name,
+            "DINO Params": f"{dino_params:,}",
+            "SigLIP Params": f"{siglip_params:,}",
+            "Total Encoder Params": f"{total_params:,}",    
+            "Trainable Params": f"{trainable_params:,}", 
+            "Fusion Mode": "Cross-Attention",
+            "Fusion Dim": self.fusion_dim,
+            "Keypoints": self.num_kp,
+            "Feature Dim": self.feature_dim,
+        }, icon="👁️")
+
+    def _setup_spatial_softmax(self, config):
+        # 这里的逻辑与之前一致，用于确定 SpatialSoftmax 的输入形状
+        first_img_shape = next(iter(config.image_features.values())).shape
+        h, w = config.resize_shape if config.resize_shape else first_img_shape[1:]
+        self.grid_h, self.grid_w = h // self.backbone.dino_p, w // self.backbone.dino_p
+        self.num_kp = config.spatial_softmax_num_keypoints
+        self.pool = SpatialSoftmax([self.fusion_dim, self.grid_h, self.grid_w], num_kp=self.num_kp)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # 简单的维度检查
-        if x.ndim != 4:
-             raise ValueError(f"Expected 4D input [B, C, H, W], got {x.shape}")
+        # 1. 提取原始特征图 [B, C, H, W]
+        dino_raw, siglip_raw = self.backbone(x)
+        B, _, H, W = dino_raw.shape
 
-        # 1. 提取特征图 [B, C, H, W]
-        dino_feat, siglip_feat = self.backbone(x)      
+        if siglip_raw.shape[-2:] != (H, W):
+            siglip_raw = F.interpolate(
+                siglip_raw, 
+                size=(H, W), 
+                mode='bilinear', 
+                align_corners=False
+            )
         
-        # 2. 空间软池化 -> 坐标 [B, num_kp, 2]
-        dino_kp = self.pool_dino(dino_feat)
-        siglip_kp = self.pool_siglip(siglip_feat)
+        # 2. 投影并展平为 Token 序列 [B, HW, D]
+        dino_qkv = self.proj_dino(dino_raw).flatten(2).permute(0, 2, 1)
+        siglip_qkv = self.proj_siglip(siglip_raw).flatten(2).permute(0, 2, 1)
 
-        # 3. 展平 坐标 [B, num_kp, 2] -> Flatten [B, num_kp*2]
-        dino_flat = torch.flatten(dino_kp, start_dim=1)   
-        siglip_flat = torch.flatten(siglip_kp, start_dim=1) 
+        # 3. 执行双向 Cross-Attention
+        # 路径 1: SigLIP(Q) + DINO(K,V) -> 几何增强的语义
+        feat_s2d, _ = self.attn_s2d(query=siglip_qkv, key=dino_qkv, value=dino_qkv)
         
-        # 4. 拼接
-        x = torch.cat([dino_flat, siglip_flat], dim=1) # [B, feature_dim]
+        # 路径 2: DINO(Q) + SigLIP(K,V) -> 语义增强的几何
+        feat_d2s, _ = self.attn_d2s(query=dino_qkv, key=siglip_qkv, value=siglip_qkv)
 
-        # 5. 线性投影 [B, feature_dim]
+        # 4. 特征融合 (这里采用求和 + LayerNorm，保持维度并实现信息互补)
+        fused_tokens = self.norm(feat_s2d + feat_d2s)
+
+        # 5. 还原为特征图并提取关键点 [B, num_kp, 2]
+        fused_feat = fused_tokens.permute(0, 2, 1).view(B, self.fusion_dim, H, W)
+        kp = self.pool(fused_feat)
+
+        # 6. 展平投影
+        x = torch.flatten(kp, start_dim=1)
         x = self.relu(self.out(x))
         
         return x
@@ -321,107 +287,86 @@ class SiglipRGBEncoder(nn.Module):
     def __init__(self, config):
         super().__init__()
         
-        # 1. 加载 SigLIP
+        # 1. 加载 SigLIP 骨干网络
         model_name = config.siglip_model_name
         self.siglip = SiglipVisionModel.from_pretrained(model_name)
-        
-        # 获取基础参数
-        self.patch_size = self.siglip.config.patch_size
         self.hidden_size = self.siglip.config.hidden_size
+        self.patch_size = self.siglip.config.patch_size
         
-        # 2. 冻结/解冻逻辑
+        # 2. 模式控制: 'spatial' (局部关键点) 或 'global' (全局向量)
+        self.mode = getattr(config, "vision_encoder_mode", "spatial") 
         self.vision_freeze = getattr(config, "vision_freeze", True)
+        
         if self.vision_freeze:
             self.siglip.requires_grad_(False)
             self.siglip.eval()
-        else:
-            self.siglip.train()
 
-        # 3. 解析输入分辨率 (H, W) 以初始化 SpatialSoftmax
-        # 优先级: Resize > Crop > 原始 config
+        # 3. 根据模式初始化不同的 Head
+        if self.mode == "spatial":
+            self._init_spatial_head(config)
+        elif self.mode == "global":
+            self._init_global_head(config)
+        else:
+            raise ValueError(f"Unknown mode: {self.mode}")
+
+    def _init_spatial_head(self, config):
+        """初始化空间特征提取分支 (SpatialSoftmax)"""
+        # 解析 H, W 以计算 grid
         if config.resize_shape:
             h, w = config.resize_shape
         elif config.crop_shape:
-            # 处理 ((x1,x2), (y1,y2)) 或 (h, w)
             if isinstance(list(config.crop_shape)[0], (list, tuple)):
                 (x0, x1), (y0, y1) = config.crop_shape
                 h, w = x1 - x0, y1 - y0
             else:
                 h, w = config.crop_shape
         else:
-            # 从 image_features 获取默认形状
             first_shape = next(iter(config.image_features.values())).shape
             h, w = first_shape[1:]
 
-        # 计算 Feature Map 的网格大小
         self.grid_h = h // self.patch_size
         self.grid_w = w // self.patch_size
         
-        # 4. 初始化 SpatialSoftmax
         self.num_kp = config.spatial_softmax_num_keypoints
-        # feature_shape: [C, H, W]
         self.pool = SpatialSoftmax([self.hidden_size, self.grid_h, self.grid_w], num_kp=self.num_kp)
-
-        # 5. 投影层
-        # 输入维度: keypoints * 2 (x, y 坐标)
-        # 输出维度: 128
+        
         self.feature_dim = self.num_kp * 2
-        
-        self.out = nn.Linear(self.feature_dim, self.feature_dim)
-        self.relu = nn.ReLU()
+        self.out = nn.Sequential(
+            nn.Linear(self.feature_dim, self.feature_dim),
+            nn.ReLU()
+        )
 
-        # # 3. 投影层 (Projection Layer)
-        # # 全局模式不再需要 SpatialSoftmax，输入直接是 hidden_size
-        # # config.output_dim 是你最终希望输出给后端的特征维度 (如 512 或 1024)
-        # self.num_kp = config.spatial_softmax_num_keypoints
-        # self.feature_dim = self.num_kp * 2
+    def _init_global_head(self, config):
+        """初始化全局特征投影分支"""
+        # 假设全局模式输出维度由 config 定义，或者沿用 num_kp * 2 保持接口一致
+        self.feature_dim = config.spatial_softmax_num_keypoints * 2
         
-        # self.projection = nn.Sequential(
-        #     nn.Linear(self.hidden_size, self.feature_dim),
-        #     nn.LayerNorm(self.feature_dim),
-        #     nn.ReLU()
-        # )
+        self.projection = nn.Sequential(
+            nn.Linear(self.hidden_size, self.feature_dim),
+            nn.LayerNorm(self.feature_dim),
+            nn.ReLU()
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x shape: [B, C, H, W]
-        
-        # 1. Backbone 前向传播
-        # 如果冻结，使用 no_grad 节省显存
         context = torch.no_grad() if self.vision_freeze else torch.enable_grad()
         
         with context:
-            # SigLIP 输出: [B, N, D]
-            # interpolate_pos_encoding=True 用于适应不同的输入分辨率
-            last_hidden_state = self.siglip(x, interpolate_pos_encoding=True).last_hidden_state
-
-        # 2. Reshape: [B, N, D] -> [B, D, grid_h, grid_w]
-        B, N, D = last_hidden_state.shape
-        # 注意：这里直接使用 Permute 转换维度
-        feat = last_hidden_state.view(B, self.grid_h, self.grid_w, D).permute(0, 3, 1, 2)
-
-        # 3. Spatial Softmax -> [B, num_kp, 2]
-        kp = self.pool(feat)
-
-        # 4. Flatten -> [B, num_kp * 2]
-        x = torch.flatten(kp, start_dim=1)
-
-        # 5. Projection -> [B, out_dim]
-        x = self.relu(self.out(x))
-        
-        # with context:
-        #     # interpolate_pos_encoding=True 允许输入不同于预训练时的分辨率
-        #     # SigLIP 会自动处理 Attention Pooling 过程
-        #     outputs = self.siglip(x, interpolate_pos_encoding=True)
+            outputs = self.siglip(x, interpolate_pos_encoding=True)
             
-        #     # 提取全局 Token [B, hidden_size]
-        #     # pooler_output 是经过 Attention Pooling 聚合后的整图表征
-        #     global_feat = outputs.pooler_output 
-
-        # # 2. 投影到目标维度
-        # # 这里的输出是一个高度压缩的语义向量
-        # x = self.projection(global_feat)
-
-        return x
+            if self.mode == "spatial":
+                # 提取 Patch Tokens: [B, N, D] -> [B, D, H, W]
+                last_hidden_state = outputs.last_hidden_state
+                B, N, D = last_hidden_state.shape
+                feat = last_hidden_state.view(B, self.grid_h, self.grid_w, D).permute(0, 3, 1, 2)
+                
+                # Spatial Softmax 提取坐标
+                kp = self.pool(feat) # [B, num_kp, 2]
+                return self.out(torch.flatten(kp, start_dim=1))
+                
+            elif self.mode == "global":
+                # 提取 Pooler Output (SigLIP 的注意力池化结果): [B, D]
+                global_feat = outputs.pooler_output 
+                return self.projection(global_feat)
 
 
 class DFomerRGBDBackbone(nn.Module):
@@ -525,26 +470,69 @@ class DFomerRGBDEncoder(nn.Module):
         super().__init__()
 
         # 1. 初始化 Backbone
-        try:
-            self.backbone = DFomerRGBDBackbone(config)
-        except Exception as e:
-            logger.error("❌ Failed to initialize DFormer inside RGBDEncoder.")
-            raise e
+        self.backbone = DFomerRGBDBackbone(config)
         
-        # 2. 获取 Backbone 输出通道数
-        # Base版: [80, 160, 320, 512]
+        # 2. 获取通道和分辨率信息以初始化池化层
+        # 以 Base 版为例: [80, 160, 320, 512]
         channels_list = self.backbone.get_out_channels()
-        self.use_layer_idx = -1
-        in_channels = channels_list[-1]
         
-        # 3. 投影层 (Projection)
-        # 作用：将 Backbone 的通道数 (如 512) 对齐到 DiT 的维度 (如 768)
-        # 使用 1x1 卷积比 Linear 更适合保留空间信息
-        self.projector = nn.Sequential(
-            nn.Conv2d(in_channels, dit_hidden_dim, kernel_size=1),
-            nn.GroupNorm(32, dit_hidden_dim), # 归一化有助于训练稳定
-            nn.SiLU() # DiT 常用的激活函数
+        # 融合 Stage 2, 3, 4 的通道
+        self.total_fused_channels = sum(channels_list[1:]) # 160 + 320 + 512 = 992
+        
+        # 获取输入分辨率和 Stage 4 的网格大小 (用于 SpatialSoftmax)
+        # 假设输入 224x224，Stage 4 缩放 32 倍，得到 7x7
+        first_img_shape = next(iter(config.image_features.values())).shape
+        h, w = config.resize_shape if config.resize_shape else first_img_shape[1:]
+        self.grid_h, self.grid_w = h // 32, w // 32 
+        
+        # 3. 初始化层次化 SpatialSoftmax
+        self.num_kp = config.spatial_softmax_num_keypoints
+        # 这里的 input_shape 必须匹配拼接后的 [C, H, W]
+        self.pool = SpatialSoftmax(
+            [self.total_fused_channels, self.grid_h, self.grid_w], 
+            num_kp=self.num_kp
         )
+        
+        # 4. 统一输出维度
+        self.feature_dim = self.num_kp * 2
+        self.out = nn.Linear(self.feature_dim, self.feature_dim)
+        self.relu = nn.ReLU()
+
+    def forward(self, rgb: torch.Tensor, depth: torch.Tensor) -> torch.Tensor:
+        # Step 0: 输入形状 [B, 3, 224, 224] 和 [B, 1, 224, 224]
+        
+        # Step 1: 提取多尺度特征
+        # feats[1] (Stage 2): [B, 160, 28, 28]
+        # feats[2] (Stage 3): [B, 320, 14, 14]
+        # feats[3] (Stage 4): [B, 512, 7, 7]
+        feats = self.backbone(rgb, depth)
+        f2, f3, f4 = feats[1], feats[2], feats[3]
+        
+        # Step 2: 空间分辨率对齐 (全部对齐到 Stage 4 的 7x7)
+        target_size = (self.grid_h, self.grid_w)
+        f2_p = F.adaptive_avg_pool2d(f2, target_size) # 形状: [B, 160, 7, 7]
+        f3_p = F.adaptive_avg_pool2d(f3, target_size) # 形状: [B, 320, 7, 7]
+        # f4 已经是 [B, 512, 7, 7]
+        
+        # Step 3: 多尺度特征拼接
+        # 形状变化: [B, 992, 7, 7] (即 160+320+512)
+        fused_map = torch.cat([f2_p, f3_p, f4], dim=1)
+        
+        # Step 4: Spatial Softmax 提取坐标
+        # 内部会进行 1x1 卷积将 992 通道投影到 num_kp
+        # 形状变化: [B, num_kp, 2] (即 64个关键点的 x,y 坐标)
+        kp = self.pool(fused_map)
+        
+        # Step 5: 展平并对齐维度
+        # 形状变化: [B, num_kp * 2] (即 128 维特征向量)
+        x = torch.flatten(kp, start_dim=1)
+        
+        # Step 6: 最终投影与激活
+        # 形状: [B, 128]
+        # 此时输出维度完全匹配 DinoSiglipRGBEncoder.feature_dim
+        x = self.relu(self.out(x))
+        
+        return x
 
 
 class ResnetRgbEncoder(nn.Module):

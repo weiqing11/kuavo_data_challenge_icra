@@ -94,21 +94,21 @@ class CustomDiffusionPolicyWrapper(DiffusionPolicy):
         if self.config.image_features:
             batch = dict(batch)  # shallow copy so that adding a key doesn't modify the original
             for key in self.config.image_features:
-                # batch[key], crop_position = crop_image(batch[key],target_range=self.config.crop_shape,random_crop=random_crop)
-                # crop_position_list.append(crop_position)
+                batch[key], crop_position = crop_image(batch[key],target_range=self.config.crop_shape,random_crop=random_crop)
+                crop_position_list.append(crop_position)
                 batch[key] = resize_image(batch[key],target_size=self.config.resize_shape, image_type="rgb")
             batch[OBS_IMAGES] = torch.stack([batch[key] for key in self.config.image_features], dim=-4)
         if self.config.use_depth and self.config.depth_features:
             batch = dict(batch)  # shallow copy so that adding a key doesn't modify the original
 
-            # for key, crop_position in zip(self.config.depth_features, crop_position_list):
-            #     if len(crop_position) == 4:
-            #         batch[key] = torchvision.transforms.functional.crop(batch[key],*crop_position)
-            #     else:
-            #         batch[key] = torchvision.transforms.functional.center_crop(batch[key],crop_position)
-            #     batch[key] = resize_image(batch[key],target_size=self.config.resize_shape, image_type="depth")
-            for key in self.config.depth_features:
+            for key, crop_position in zip(self.config.depth_features, crop_position_list):
+                if len(crop_position) == 4:
+                    batch[key] = torchvision.transforms.functional.crop(batch[key],*crop_position)
+                else:
+                    batch[key] = torchvision.transforms.functional.center_crop(batch[key],crop_position)
                 batch[key] = resize_image(batch[key],target_size=self.config.resize_shape, image_type="depth")
+            # for key in self.config.depth_features:
+            #     batch[key] = resize_image(batch[key],target_size=self.config.resize_shape, image_type="depth")
             batch[OBS_DEPTH] = torch.stack([batch[key] for key in self.config.depth_features], dim=-4)
             batch[OBS_DEPTH] = batch[OBS_DEPTH].mean(dim=-3, keepdim=True)  # if multiple channels depth images, average them
 
@@ -231,17 +231,17 @@ class CustomDiffusionPolicyWrapper(DiffusionPolicy):
         if self.config.image_features:
             batch = dict(batch)  # shallow copy so that adding a key doesn't modify the original
             for key in self.config.image_features:
-                #batch[key], crop_position = crop_image(batch[key],target_range=self.config.crop_shape,random_crop=random_crop)
+                batch[key], crop_position = crop_image(batch[key],target_range=self.config.crop_shape,random_crop=random_crop)
                 batch[key] = resize_image(batch[key],target_size=self.config.resize_shape, image_type="rgb")
             # batch[OBS_IMAGES] = torch.stack([batch[key] for key in self.config.image_features], dim=-4)
         if self.config.use_depth and self.config.depth_features:
             batch = dict(batch)  # shallow copy so that adding a key doesn't modify the original
 
             for key in self.config.depth_features:
-                # if len(crop_position) == 4:
-                #     batch[key] = torchvision.transforms.functional.crop(batch[key],*crop_position)
-                # else:
-                #     batch[key] = torchvision.transforms.functional.center_crop(batch[key],crop_position)
+                if len(crop_position) == 4:
+                    batch[key] = torchvision.transforms.functional.crop(batch[key],*crop_position)
+                else:
+                    batch[key] = torchvision.transforms.functional.center_crop(batch[key],crop_position)
                 # print(batch[key].dtype,"~~~~~~~~~~~~~~~~~~")
                 batch[key] = resize_image(batch[key],target_size=self.config.resize_shape, image_type="depth")
             # batch[OBS_DEPTH] = torch.stack([batch[key] for key in self.config.depth_features], dim=-4)

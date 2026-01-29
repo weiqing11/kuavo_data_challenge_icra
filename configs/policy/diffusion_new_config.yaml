@@ -7,7 +7,7 @@ hydra:  # Hydra config directory, for parameter checking only
 
 
 task: "Task1"  # Custom task name. If using huggingface datasets instead of local dataset, please specify, such as pusht, aloha_sim_insertion_human etc.
-method: "siglip+local"  # Custom method name
+method: "dino+siglip_fusion"  # Custom method name
 timestamp: ${now:%Y%m%d_%H%M%S}  # Auto-obtained timestamp
 # 训练时模型参数的保存目录在outputs/train/<task>/<method>/<timestamp>中
 repoid: "lerobot/${task}"  # Newer versions of lerobot require this, for lerobot reference only. Not actually used elsewhere.
@@ -118,14 +118,17 @@ policy:
 
     # Model hyperparameters adjustments
     # vision_backbone: resnet18
-    vision_backbone: "siglip_only"
+    vision_backbone: "dinov2+siglip" #"siglip_only"
     vision_backbone_rgbd: "DFormerv2_small"
 
     dinov2_model_name: "facebook/dinov2-small"
     siglip_model_name: "google/siglip2-base-patch16-224"
     DFormer_path: None
 
+    vision_encoder_mode: global
     vision_freeze: False  # 是否冻结模型参数
+    vision_fusion_dim: 256
+    vision_attn_heads: 8
     spatial_softmax_num_keypoints: 64
     use_separate_rgb_encoder_per_camera: False
 

@@ -32,6 +32,9 @@ class CustomDiffusionConfigWrapper(DiffusionConfig):
     siglip_model_name: str = None
     DFormer_path: str = None
     vision_freeze: bool = True
+    vision_encoder_mode: str = None
+    vision_attn_heads: int = None
+    vision_fusion_dim: int = None
     # ==================================================
 
     def __post_init__(self):

@@ -564,14 +564,13 @@ class NoiseAdder_AfterNorm2:
             noisy_nsample[key] += noise
 
         return noisy_nsample
-    
 
 
 def resize_image(
     image: Tensor, 
     target_size: tuple[int, int], 
     image_type='rgb', 
-    mode='crop'  # 'pad' 或 'crop'
+    mode='pad'  # 'pad' 或 'crop'
 ) -> Tensor:
     # 1. 准备参数
     h, w = image.shape[-2:]

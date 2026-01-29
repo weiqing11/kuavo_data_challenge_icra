@@ -27,7 +27,7 @@ class KuavoBaseRosEnv(gym.Env):
     """Kuavo机器人ROS环境基类"""
 
     def __init__(self, config: KuavoConfig):
-        self._set_config(config.env)
+        self._set_config(config.env, config.inference)
         
         # 初始化ROS管理器 Initialise ROS manager
         self.ros_manager = ROSManager()
@@ -44,7 +44,7 @@ class KuavoBaseRosEnv(gym.Env):
         log_robot.info(f"Inializing done!")
         print(f"Inializing done!")
 
-    def _set_config(self, config_kuavo_env):
+    def _set_config(self, config_kuavo_env, config_kuavo_inference):
         """设置配置参数 Set configuration parameters"""
         self.ros_rate = config_kuavo_env.ros_rate
         self.control_mode = config_kuavo_env.control_mode
@@ -75,6 +75,7 @@ class KuavoBaseRosEnv(gym.Env):
         self.point_cloud_channels = 6
         self.point_cloud_rgb_key = "head_cam_h"
         self.point_cloud_depth_key = "depth_h"
+        self.need_point_cloud = config_kuavo_inference.need_point_cloud
 
     def _set_observation_space(self):
         limits = self.limits
@@ -518,24 +519,27 @@ class KuavoBaseRosEnv(gym.Env):
         obs["observation.state"] = torch.from_numpy(obs["observation.state"]).float().unsqueeze(0)
 
         # -------- Point cloud computation --------
-        # 检查 ObsBuffer 是否被修改（是否存在 raw 属性）
-        if not hasattr(self.obs_buffer, 'raw_rgb_frames') or not hasattr(self.obs_buffer, 'raw_depth_frames'):
-             raise RuntimeError("ObsBuffer is missing raw frame storage! Please update obs_buffer.py.")
-        rgb_key = self.point_cloud_rgb_key
-        depth_key = self.point_cloud_depth_key
-        # 从缓存获取数据
-        rgb_frame = self.obs_buffer.raw_rgb_frames.get(rgb_key)
-        depth_frame = self.obs_buffer.raw_depth_frames.get(depth_key)
-        if rgb_frame is None:
-            raise ValueError(f"Point Cloud Error: Raw RGB frame not found for key '{rgb_key}'. Waiting for callback?")
-        if depth_frame is None:
-            raise ValueError(f"Point Cloud Error: Raw Depth frame not found for key '{depth_key}'. Waiting for callback?")
+        if self.need_point_cloud:
+            # 检查 ObsBuffer 是否被修改（是否存在 raw 属性）
+            if not hasattr(self.obs_buffer, 'raw_rgb_frames') or not hasattr(self.obs_buffer, 'raw_depth_frames'):
+                raise RuntimeError("ObsBuffer is missing raw frame storage! Please update obs_buffer.py.")
+            rgb_key = self.point_cloud_rgb_key
+            depth_key = self.point_cloud_depth_key
+            # 从缓存获取数据
+            rgb_frame = self.obs_buffer.raw_rgb_frames.get(rgb_key)
+            depth_frame = self.obs_buffer.raw_depth_frames.get(depth_key)
+            if rgb_frame is None:
+                raise ValueError(f"Point Cloud Error: Raw RGB frame not found for key '{rgb_key}'. Waiting for callback?")
+            if depth_frame is None:
+                raise ValueError(f"Point Cloud Error: Raw Depth frame not found for key '{depth_key}'. Waiting for callback?")
 
-        pcd_array = process_pcd_task1(rgb_frame, depth_frame)
-        if pcd_array is None:
-             raise ValueError("Point Cloud Error: process_pcd_task1 returned None!")
+            pcd_array = process_pcd_task1(rgb_frame, depth_frame)
+            if pcd_array is None:
+                raise ValueError("Point Cloud Error: process_pcd_task1 returned None!")
 
-        obs["observation.point_cloud"] = torch.from_numpy(pcd_array).float().unsqueeze(0)
+            obs["observation.point_cloud"] = torch.from_numpy(pcd_array).float().unsqueeze(0)
+        else:
+            pass
         
         return obs
 

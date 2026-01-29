@@ -161,6 +161,7 @@ class ConfigInference:
     epoch: int = 1
     max_episode_steps: int = 1000
     env_name: str = "Kuavo-Sim"
+    need_point_cloud: bool = False
 
     def validate(self):
         if self.policy_type not in ["diffusion", "act", "idp3"]:
@@ -169,6 +170,9 @@ class ConfigInference:
             raise ValueError(f"Unsupported policy_type '{self.policy_type}'")
         if self.device not in ["cuda", "cpu"]:
             raise ValueError("device must be 'cuda' or 'cpu'")
+        if self.policy_type in ["idp3"]:
+            # 如果未来支持更多需要点云的策略，请在此扩展
+            self.need_point_cloud = True
 
 
 # -----------------------

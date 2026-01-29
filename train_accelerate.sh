@@ -1,3 +1,4 @@
+
 accelerate launch \
     --config_file configs/accelerate/accelerate_config.yaml \
     kuavo_train/train_policy_with_accelerate.py \
