@@ -35,6 +35,9 @@ class CustomDiffusionConfigWrapper(DiffusionConfig):
     vision_encoder_mode: str = None
     vision_attn_heads: int = None
     vision_fusion_dim: int = None
+    use_lora: str = None
+    lora_rank: int = None
+    lora_alpha: int = None
     # ==================================================
 
     def __post_init__(self):

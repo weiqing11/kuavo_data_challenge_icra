@@ -28,6 +28,12 @@ from kuavo_train.wrapper.policy.diffusion_new.DFormerv2 import DFormerv2_S, DFor
 from diffusers.schedulers.scheduling_ddim import DDIMScheduler
 from diffusers.schedulers.scheduling_ddpm import DDPMScheduler
 from diffusers import StableDiffusion3Pipeline
+
+import matplotlib.pyplot as plt
+import numpy as np
+import time
+from peft import get_peft_model, LoraConfig, TaskType
+
 OBS_DEPTH = "observation.depth"
 
 # ---------------------------
@@ -41,6 +47,66 @@ def _make_noise_scheduler_factory(name: str, **kwargs: Dict[str, Any]):
     else:
         raise ValueError(f"Unsupported noise scheduler type {name}")
 
+class EnhancedSpatialSoftmax(nn.Module):
+    def __init__(
+        self, 
+        input_shape, 
+        num_kp=64, 
+        initial_temp=1.0, 
+        dropout_prob=0.1,
+        use_normalization=True
+    ):
+        super().__init__()
+        self._in_c, self._in_h, self._in_w = input_shape
+        self._out_c = num_kp
+
+        # 1. 特征提取增强层：增加非线性映射和归一化
+        layers = [nn.Conv2d(self._in_c, num_kp, kernel_size=1)]
+        if use_normalization:
+            # 使用 GroupNorm 而不是 BatchNorm，因为机器人训练通常 Batch 很小
+            layers.append(nn.GroupNorm(num_groups=min(8, num_kp), num_channels=num_kp))
+        
+        layers.append(nn.ReLU()) # 强制过滤负向信号，只保留正面响应
+        self.feature_extractor = nn.Sequential(*layers)
+
+        # 2. 空间 Dropout：强迫模型不要死磕某一个背景纹理
+        self.dropout = nn.Dropout2d(p=dropout_prob)
+
+        # 3. 可学习的温度系数（按通道独立学习）
+        # 不同的关键点可能需要不同的锐度
+        self.log_temp = nn.Parameter(torch.ones(1, num_kp, 1) * np.log(initial_temp))
+
+        # 4. 坐标网格生成 (保持 [-1, 1])
+        pos_x, pos_y = np.meshgrid(np.linspace(-1.0, 1.0, self._in_w), np.linspace(-1.0, 1.0, self._in_h))
+        pos_grid = torch.from_numpy(np.stack([pos_x, pos_y], axis=-1)).reshape(-1, 2).float()
+        self.register_buffer("pos_grid", pos_grid)
+
+    def forward(self, features: Tensor) -> Tensor:
+        # Step A: 维度映射与激活
+        # [B, in_C, H, W] -> [B, K, H, W]
+        x = self.feature_extractor(features)
+        
+        # Step B: 空间 Dropout
+        # 随机丢弃部分特征块，防止模型产生对背景特定像素的依赖
+        x = self.dropout(x)
+
+        # Step C: 应用温度系数
+        # [B, K, H*W]
+        B, K, H, W = x.shape
+        x = x.view(B, K, H * W)
+        temp = torch.exp(self.log_temp)
+        x = x * temp
+
+        # Step D: 数值稳定的 Softmax
+        # 减去 Max 可以防止 exp(100) 导致的数值溢出
+        x_max = x.max(dim=-1, keepdim=True)[0].detach()
+        attention = F.softmax(x - x_max, dim=-1)
+
+        # Step E: 计算质心坐标
+        # [B, K, H*W] @ [H*W, 2] -> [B, K, 2]
+        expected_xy = torch.matmul(attention, self.pos_grid)
+        
+        return expected_xy
 
 # === Definitions for MLP Projection Module, with Signature :: [..., in_dim] --> [..., out_dim] ===
 class MLPProjector(nn.Module):
@@ -290,16 +356,48 @@ class SiglipRGBEncoder(nn.Module):
         # 1. 加载 SigLIP 骨干网络
         model_name = config.siglip_model_name
         self.siglip = SiglipVisionModel.from_pretrained(model_name)
+        
+        # === [新增] LoRA 配置 ===
+        # 检查配置中是否启用了 use_lora (建议在 config 里加这个开关)
+        self.use_lora = getattr(config, "use_lora", False)
+        
+        if self.use_lora:
+            logger.info(f"🔧 Applying LoRA to SigLIP Backbone...")
+            # 针对 Vision Transformer 的常见 LoRA 配置
+            # target_modules 通常是 query, value, key, dense 等
+            # 对于 HF 的 SigLIP，通常层名包含 "q_proj", "v_proj"
+            peft_config = LoraConfig(
+                r=getattr(config, "lora_rank", 16),       # 秩，越大适应能力越强，显存越多
+                lora_alpha=getattr(config, "lora_alpha", 32), # 缩放系数，通常是 rank 的 2 倍
+                target_modules=["q_proj", "v_proj"],      # 只微调 Attention 的 Q 和 V
+                lora_dropout=0.05,
+                bias="none",
+                modules_to_save=[], # 这一项留空，我们不需要保存 classifier
+            )
+            
+            # 这行代码会自动冻结主干，只把 LoRA 层设为 requires_grad=True
+            self.siglip = get_peft_model(self.siglip, peft_config)
+            
+            # 打印可训练参数量，确认 LoRA 生效
+            #self.siglip.print_trainable_parameters()
+            
+        else:
+            # 原有的冻结逻辑
+            self.vision_freeze = getattr(config, "vision_freeze", True)
+            if self.vision_freeze:
+                self.siglip.requires_grad_(False)
+                self.siglip.eval()
+
         self.hidden_size = self.siglip.config.hidden_size
         self.patch_size = self.siglip.config.patch_size
         
         # 2. 模式控制: 'spatial' (局部关键点) 或 'global' (全局向量)
         self.mode = getattr(config, "vision_encoder_mode", "spatial") 
-        self.vision_freeze = getattr(config, "vision_freeze", True)
+        # self.vision_freeze = getattr(config, "vision_freeze", True)
         
-        if self.vision_freeze:
-            self.siglip.requires_grad_(False)
-            self.siglip.eval()
+        # if self.vision_freeze:
+        #     self.siglip.requires_grad_(False)
+        #     self.siglip.eval()
 
         # 3. 根据模式初始化不同的 Head
         if self.mode == "spatial":
@@ -308,6 +406,10 @@ class SiglipRGBEncoder(nn.Module):
             self._init_global_head(config)
         else:
             raise ValueError(f"Unknown mode: {self.mode}")
+
+        # DEBUG
+        self.last_log_time = 0      # 上次保存图片的时间
+        self.log_interval = 600.0    # 设定间隔：1000 秒 (你可以随意改)
 
     def _init_spatial_head(self, config):
         """初始化空间特征提取分支 (SpatialSoftmax)"""
@@ -328,7 +430,8 @@ class SiglipRGBEncoder(nn.Module):
         self.grid_w = w // self.patch_size
         
         self.num_kp = config.spatial_softmax_num_keypoints
-        self.pool = SpatialSoftmax([self.hidden_size, self.grid_h, self.grid_w], num_kp=self.num_kp)
+        #self.pool = SpatialSoftmax([self.hidden_size, self.grid_h, self.grid_w], num_kp=self.num_kp)
+        self.pool = EnhancedSpatialSoftmax([self.hidden_size, self.grid_h, self.grid_w], num_kp=self.num_kp)
         
         self.feature_dim = self.num_kp * 2
         self.out = nn.Sequential(
@@ -348,7 +451,8 @@ class SiglipRGBEncoder(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        context = torch.no_grad() if self.vision_freeze else torch.enable_grad()
+        requires_grad = self.use_lora or (not self.vision_freeze)
+        context = torch.enable_grad() if requires_grad else torch.no_grad()
         
         with context:
             outputs = self.siglip(x, interpolate_pos_encoding=True)
@@ -361,6 +465,95 @@ class SiglipRGBEncoder(nn.Module):
                 
                 # Spatial Softmax 提取坐标
                 kp = self.pool(feat) # [B, num_kp, 2]
+                
+                # ================== 2. DEBUG 可视化代码块 (多图版) ==================
+                # 变量映射：x -> input_img, feat -> feat_map, kp -> kps_coords
+                input_img = x
+                feat_map = feat
+                kps_coords = kp
+
+                # 初始化计数器
+                if not hasattr(self, "_debug_counter"):
+                    self._debug_counter = 0
+                self._debug_counter += 1
+
+                # 每 1000 次步绘制一次 (可以根据需要改回 10 或 100)
+                if self._debug_counter % 1000 == 0:
+                    try:
+                        import matplotlib.pyplot as plt
+                        import os
+                        import numpy as np
+                        import torch.nn.functional as F
+                        
+                        save_dir = "/home/liangweiqing/data/code/kuavo_data_challenge_icra/debug_visualizations"
+                        os.makedirs(save_dir, exist_ok=True)
+                        
+                        # 确定要可视化的数量 (最大取 3)
+                        num_vis = min(3, input_img.shape[0])
+                        
+                        # 创建画布：num_vis 行，4 列
+                        fig, axes = plt.subplots(num_vis, 4, figsize=(16, 4 * num_vis), dpi=100)
+                        
+                        # 如果只有 1 张图，axes 会是 1D array，将其统一为 2D 方便索引
+                        if num_vis == 1:
+                            axes = np.expand_dims(axes, axis=0)
+
+                        for i in range(num_vis):
+                            # --- 提取数据并转为 CPU ---
+                            img_t = input_img[i].detach().cpu()       # [3, H, W]
+                            feat_t = feat_map[i].detach().cpu()       # [C, Hf, Wf]
+                            kps_t = kps_coords[i].detach().cpu()      # [K, 2]
+
+                            # --- A. 还原原图 (自适应 min-max) ---
+                            img_vis = img_t.permute(1, 2, 0).numpy()
+                            img_min, img_max = img_vis.min(), img_vis.max()
+                            img_vis = (img_vis - img_min) / (img_max - img_min + 1e-8)
+                            img_vis = np.clip(img_vis, 0, 1)
+                            H, W = img_vis.shape[:2]
+
+                            # --- B. 特征图可视化 (平均通道) ---
+                            feat_vis = feat_t.mean(dim=0).numpy()
+
+                            # --- C. 热力图可视化 ---
+                            C, Hf, Wf = feat_t.shape
+                            heatmap = F.softmax(feat_t.view(C, -1), dim=1).view(C, Hf, Wf)
+                            heatmap_vis = heatmap.max(dim=0)[0].numpy()
+
+                            # --- D. 关键点坐标转换 ---
+                            kps_x = ((kps_t[:, 0] + 1) / 2 * W).numpy()
+                            kps_y = ((kps_t[:, 1] + 1) / 2 * H).numpy()
+
+                            # --- E. 绘图 ---
+                            # 1. 原图
+                            axes[i, 0].imshow(img_vis)
+                            axes[i, 0].set_title(f"Img {i} (Step {self._debug_counter})")
+                            axes[i, 0].axis('off')
+
+                            # 2. 特征图
+                            axes[i, 1].imshow(feat_vis, cmap='viridis')
+                            axes[i, 1].set_title("Feature Map (Mean)")
+                            axes[i, 1].axis('off')
+
+                            # 3. 热力图
+                            axes[i, 2].imshow(heatmap_vis, cmap='jet')
+                            axes[i, 2].set_title("Softmax Heatmap")
+                            axes[i, 2].axis('off')
+
+                            # 4. 关键点覆盖
+                            axes[i, 3].imshow(img_vis)
+                            axes[i, 3].scatter(kps_x, kps_y, c='r', s=15, marker='x', linewidths=1.0)
+                            axes[i, 3].set_title(f"Keypoints (N={len(kps_x)})")
+                            axes[i, 3].axis('off')
+
+                        plt.tight_layout()
+                        save_path = os.path.join(save_dir, f"new_spatialsoftmax_batch_{self._debug_counter}.png")
+                        plt.savefig(save_path)
+                        plt.close()
+
+                    except Exception as e:
+                        print(f"[DEBUG ERROR] {e}")
+                # ================== DEBUG END ==================
+
                 return self.out(torch.flatten(kp, start_dim=1))
                 
             elif self.mode == "global":
@@ -499,6 +692,10 @@ class DFomerRGBDEncoder(nn.Module):
             nn.ReLU()
         )
 
+        # DEBUG
+        self.last_log_time = 0      # 上次保存图片的时间
+        self.log_interval = 600.0    # 设定间隔：30 秒 (你可以随意改)
+
     def forward(self, rgb: torch.Tensor, depth: torch.Tensor) -> torch.Tensor:
         feats = self.backbone(rgb, depth)
         f2, f3, f4 = feats[1], feats[2], feats[3]
@@ -518,6 +715,78 @@ class DFomerRGBDEncoder(nn.Module):
         # 形状变化: [B, num_kp, 2] (即 64个关键点的 x,y 坐标)
         kp = self.pool(fused_map)
         
+        # [DEBUG START] ==========================================================
+        # 无条件执行：每次都画图，覆盖同一张文件
+        current_time = time.time()
+        
+        # 如果距离上次打印超过了设定的间隔
+        if current_time - self.last_log_time > self.log_interval:
+            # 立即更新时间戳 (防止短时间内多次进入)
+            self.last_log_time = current_time
+
+            try:
+                # 选取 Batch 第 0 张
+                idx = 0
+                
+                # --- 数据准备 (转 Numpy) ---
+                # RGB
+                rgb_vis = rgb[idx].detach().cpu().permute(1, 2, 0).numpy()
+                rgb_vis = (rgb_vis - rgb_vis.min()) / (rgb_vis.max() - rgb_vis.min() + 1e-8)
+                
+                # Depth (降维 [1, H, W] -> [H, W])
+                depth_vis = depth[idx].detach().cpu().squeeze(0).numpy()
+                depth_vis = (depth_vis - depth_vis.min()) / (depth_vis.max() - depth_vis.min() + 1e-8)
+
+                # Feature Map (Mean across channels)
+                heatmap_tensor = fused_map[idx].mean(dim=0)
+                heatmap_vis = heatmap_tensor.detach().cpu().numpy()
+                
+                # Keypoints (还原到像素坐标)
+                kps = kp[idx].detach().cpu().numpy() # [num_kp, 2]
+                H, W = rgb_vis.shape[:2]
+                
+                # 假设 SpatialSoftmax 输出范围 [-1, 1]
+                kp_x = (kps[:, 0] + 1) / 2 * W
+                kp_y = (kps[:, 1] + 1) / 2 * H
+                
+                # --- 绘图 ---
+                # 创建画布 (如果不 close 会内存泄露，所以下面必须 close)
+                fig, axes = plt.subplots(1, 4, figsize=(20, 5))
+                
+                # 1. RGB
+                axes[0].imshow(rgb_vis)
+                axes[0].set_title("RGB Input")
+                axes[0].axis('off')
+                
+                # 2. Depth
+                axes[1].imshow(depth_vis, cmap='magma')
+                axes[1].set_title("Depth Input")
+                axes[1].axis('off')
+
+                # 3. Features
+                axes[2].imshow(heatmap_vis, cmap='viridis')
+                axes[2].set_title(f"Fused Features")
+                axes[2].axis('off')
+                
+                # 4. Result Overlay
+                axes[3].imshow(rgb_vis)
+                axes[3].scatter(kp_x, kp_y, c='red', s=30, marker='x', alpha=0.7)
+                axes[3].set_title(f"Spatial Softmax")
+                axes[3].axis('off')
+                
+                # 保存并覆盖
+                save_path = "debug_dformer_latest.png"
+                plt.tight_layout()
+                plt.savefig(save_path)
+                plt.close(fig) # 关键：释放内存
+                
+                # 可选：打印一句提示，如果你觉得刷屏太快可以注释掉
+                # print(f"📸 [DEBUG] Updated: {save_path}")
+                
+            except Exception as e:
+                print(f"❌ [DEBUG] Vis Error: {e}")
+        # [DEBUG END] ============================================================
+
         # Step 5: 展平并对齐维度
         # 形状变化: [B, num_kp * 2] (即 128 维特征向量)
         x = torch.flatten(kp, start_dim=1)

@@ -93,7 +93,8 @@ def build_delta_timestamps(dataset_metadata, policy_cfg):
 
 def build_optimizer_and_scheduler(policy, cfg, total_frames, accelerator):
     """Return optimizer and scheduler."""
-    optimizer = policy.config.get_optimizer_preset().build(policy.parameters())
+    #optimizer = policy.config.get_optimizer_preset().build(policy.parameters())
+    optimizer = policy.config.get_optimizer_preset().build([p for p in policy.parameters() if p.requires_grad])
     # If `max_training_step` is specified, it takes precedence; 
     # otherwise, the value is automatically determined based on `max_epoch`.
     if cfg.training.max_training_step is None:
