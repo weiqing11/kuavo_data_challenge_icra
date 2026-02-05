@@ -225,11 +225,14 @@ class IDP3Encoder(nn.Module):  # noqa: N801
     ):
         super().__init__()
         self.state_key = "observation.state"
-        self.point_cloud_key = "observation.point_cloud"
-        self.n_output_channels = pointcloud_encoder_cfg.out_channels
+        self.point_cloud_keys = ["observation.pc_h", "observation.pc_l", "observation.pc_r"]
 
-        self.point_cloud_shape = observation_space[self.point_cloud_key]
+        self.point_cloud_shape = observation_space[self.point_cloud_keys[0]]
         self.state_shape = observation_space[self.state_key]
+
+        self.num_views = len(self.point_cloud_keys)
+        self.encoder_out_channels = pointcloud_encoder_cfg.out_channels
+        self.n_output_channels = self.encoder_out_channels * self.num_views
 
         self.num_points = pointcloud_encoder_cfg.num_points  # 4096
 
@@ -268,16 +271,25 @@ class IDP3Encoder(nn.Module):  # noqa: N801
         logger.debug(f"[DP3Encoder] output dim: {self.n_output_channels}")
 
     def forward(self, observations: Dict) -> torch.Tensor:
-        points = observations[self.point_cloud_key]
-        assert len(points.shape) == 3, f"point cloud shape: {points.shape}, length should be 3"
+        # 处理多视角输入
+        pc_list = []
+        for key in self.point_cloud_keys:
+            points = observations[key]
+            # points shape: (Batch, N, C) 或 (Batch*T, N, C) 取決於外部調用
+            assert len(points.shape) == 3, f"point cloud shape: {points.shape}, length should be 3"
+            
+            if self.downsample:
+                points = self.point_preprocess(points, self.num_points)
+            pc_list.append(points)
+        
+        # 將多視角數據在 Batch 維度拼接，以實現共享編碼器的並行計算
+        # [B, N, C] * 3 -> [B * 3, N, C]
+        batch_size = pc_list[0].shape[0]
+        all_points = torch.cat(pc_list, dim=0)
 
-        # points = torch.transpose(points, 1, 2)   # B * 3 * N
-        # points: B * 3 * (N + sum(Ni))
-        if self.downsample:
-            points = self.point_preprocess(points, self.num_points)
-
-        pn_feat = self.extractor(points)  # B * out_channel
-
+        all_feat = self.extractor(all_points)
+        pn_feat = all_feat.view(self.num_views, batch_size, -1).permute(1, 0, 2).reshape(batch_size, -1)
+        
         state = observations[self.state_key]
         state_feat = self.state_mlp(state)  # B * 64
         final_feat = torch.cat([pn_feat, state_feat], dim=-1)

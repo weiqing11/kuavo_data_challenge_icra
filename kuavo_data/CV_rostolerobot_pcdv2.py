@@ -1,6 +1,4 @@
-import lerobot_patches.custom_patches  
 import dataclasses
-from dataclasses import dataclass, field
 from pathlib import Path
 import shutil
 import hydra
@@ -10,21 +8,14 @@ import sys
 import os
 from rich.logging import RichHandler
 import logging
-import resource
-import open3d as o3d
-from pympler import asizeof
-import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import tqdm
-import json
+ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if ROOT_DIR not in sys.path:
+    sys.path.insert(0, ROOT_DIR)
 import kuavo_data.common.kuavo_dataset as kuavo
-import rospy
-
-project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-if project_root not in sys.path:
-    sys.path.append(project_root)
-from kuavo_data.common.pcd_utils import process_pcd_task1
+from kuavo_data.common.pcd_utils_cpu import resize_images, process_pcd_task1
 
 logging.basicConfig(
     level="DEBUG",
@@ -33,8 +24,7 @@ logging.basicConfig(
     handlers=[RichHandler(rich_tracebacks=True)]
 )
 
-# 临时测试使用：
-# -------------------------------------------------
+# 默认手臂关节角度范围限制
 DEFAULT_ARM_JOINT_RANGE = [
     [-3.14159, 1.5708], 
     [-0.349066, 2.0944], 
@@ -52,9 +42,7 @@ DEFAULT_ARM_JOINT_RANGE = [
     [-0.698132, 1.309], 
     [-0.698132, 0.698132],
     [-1, 1]
-] 
-# -------------------------------------------------
-
+]
 
 log_print = logging.getLogger("rich")
 
@@ -90,16 +78,12 @@ except Exception as import_error:
 class DatasetConfig:
     use_videos: bool = True
     tolerance_s: float = 0.0001
-    image_writer_processes: int = 10
+    image_writer_processes: int = 20
     image_writer_threads: int = 5
     video_backend: str | None = None
-    camera_intrinsic: list = field(default_factory=lambda: [
-        [528.0, 0.0, 320.0],
-        [0.0, 528.0, 240.0],
-        [0.0, 0.0, 1.0]
-    ])
 
 DEFAULT_DATASET_CONFIG = DatasetConfig()
+
 
 def get_cameras(bag_data: dict) -> list[str]:
     """
@@ -163,11 +147,6 @@ def create_empty_dataset(
                 "action_names": action_name
             }
         },
-        "observation.point_cloud": {
-            "dtype": "float32",
-            "shape": (4096, 6),
-            "names": ["x", "y", "z", "r", "g", "b"]
-        },
     }
 
     if has_velocity:
@@ -187,6 +166,16 @@ def create_empty_dataset(
                 motors,
             ],
         }
+
+    for cam in ('h', 'l', 'r'):
+        for method in ('fps', 'random', 'voxel', 'normals', 'curvature'):
+            features[f"observation.pc_{cam}_{method}"] = {
+                "dtype": "float32",
+                "shape": (8192, 6),  # x,y,z,r,g,b
+                "names": [
+                    "x", "y", "z", "r", "g", "b"
+                ],
+            }
 
     for cam in cameras:
         if 'depth' in cam:
@@ -283,8 +272,6 @@ def populate_dataset(
         episodes = range(len(bag_files))
     failed_bags = []
     print( f"Total episodes to process: {len(episodes)}")
-    
-    intrinsic_matrix = np.array(DEFAULT_DATASET_CONFIG.camera_intrinsic)
 
     for ep_idx in tqdm.tqdm(episodes):
         ep_path = bag_files[ep_idx]
@@ -292,16 +279,6 @@ def populate_dataset(
         print(colored(f"Processing {ep_path}", "yellow", attrs=["bold"]))
 
         imgs_per_cam, state, action, velocity, effort ,claw_state, claw_action,qiangnao_state,qiangnao_action, rq2f85_state, rq2f85_action, cmd_pos_world_action, action_kuavo_arm_traj = load_raw_episode_data(ep_path)
-
-        # 点云数据
-        head_rgb_key = None
-        head_depth_key = None
-        # 遍历读取到的所有相机数据寻找 key
-        for key in imgs_per_cam.keys():
-            if "head" in key and "depth" not in key:
-                head_rgb_key = key
-            if "depth" in key and ("head" in key or "_h" in key): 
-                head_depth_key = key    
 
         # 对手部进行二值化处理
         if kuavo.IS_BINARY:
@@ -414,18 +391,25 @@ def populate_dataset(
                 "action": torch.from_numpy(final_action).type(torch.float32),                # left+right: pos+rot6d+gripper;  dim: 2*10                  
             }
 
-            # 处理点云数据
-            pcd_data = np.zeros((0, 6), dtype=np.float32)
-            
-            if head_rgb_key and head_depth_key:
-                # 获取当前帧图像
-                curr_rgb = imgs_per_cam[head_rgb_key][i]
-                curr_depth = imgs_per_cam[head_depth_key][i]
-
-                pcd_data = process_pcd_task1(curr_rgb, curr_depth, intrinsic_matrix)
-            
-            # 存入 frame
-            frame["observation.point_cloud"] = torch.from_numpy(pcd_data)
+            # 处理点云
+            for cam in ('h', 'l', 'r'):
+                if cam == 'h':
+                    rgb_key = 'head_cam_h'
+                    depth_key = 'depth_h'
+                elif cam == 'l':
+                    rgb_key = 'wrist_cam_l'
+                    depth_key = 'depth_l'
+                elif cam == 'r':
+                    rgb_key = 'wrist_cam_r'
+                    depth_key = 'depth_r'
+                else:
+                    raise ValueError(f"Unknown camera: {cam}")
+                rgb_img = imgs_per_cam[rgb_key][i]
+                depth_img = imgs_per_cam[depth_key][i]
+                rgb_img, depth_img = resize_images(rgb_img, depth_img, 320, 240)
+                for method in ('fps', 'random', 'voxel', 'normals', 'curvature'):
+                    pcd_points = process_pcd_task1(rgb_img, depth_img, f"cam_{cam}", method)
+                    frame[f"observation.pc_{cam}_{method}"] = pcd_points
 
             for idx, (camera, img_array) in enumerate(imgs_per_cam.items()):
                 if "depth" in camera:
@@ -463,6 +447,7 @@ def populate_dataset(
 
     return dataset
             
+
 
 def port_kuavo_rosbag(
     raw_dir: Path,
@@ -560,6 +545,10 @@ def main(cfg: DictConfig):
     port_kuavo_rosbag(raw_dir, repo_id, root=lerobot_dir,n = n, task=kuavo.TASK_DESCRIPTION)
 
 
-if __name__ == "__main__":  
+
+if __name__ == "__main__":
+    
     main()
+    
+
     

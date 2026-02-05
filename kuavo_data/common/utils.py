@@ -2,7 +2,11 @@ import json
 import os
 import shutil
 import subprocess
-import rosbag
+try:
+    import rosbag
+except ImportError:
+    rosbag = None
+    print("[Warning] rosbag not found, related functions will fail if called.")
 from pathlib import Path
 from typing import Any
 

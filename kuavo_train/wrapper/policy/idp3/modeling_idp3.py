@@ -84,7 +84,9 @@ class IDP3Policy(PreTrainedPolicy):
         """Clear observation and action queues. Should be called on `env.reset()`"""
         self._queues = {
             "observation.state": deque(maxlen=self.config.n_obs_steps),
-            "observation.point_cloud": deque(maxlen=self.config.n_obs_steps),
+            "observation.pc_h": deque(maxlen=self.config.n_obs_steps),
+            "observation.pc_l": deque(maxlen=self.config.n_obs_steps),
+            "observation.pc_r": deque(maxlen=self.config.n_obs_steps),
         }
         if self.config.image_features:
             self._queues["observation.images"] = deque(maxlen=self.config.n_obs_steps)
@@ -132,7 +134,9 @@ class IDP3Policy(PreTrainedPolicy):
 
         action = self.action_queue.popleft()
         self._queues["observation.state"].popleft()
-        self._queues["observation.point_cloud"].popleft()
+        self._queues["observation.pc_h"].popleft()
+        self._queues["observation.pc_l"].popleft()
+        self._queues["observation.pc_r"].popleft()
         return action
 
     def forward(self, batch: dict[str, Tensor]) -> tuple[Tensor, None]:
@@ -167,7 +171,7 @@ class IDP3Model(nn.Module):
             pc_channels=config.PointCloudEncoderConfig.in_channels,
             use_pc_color=False,
             pointnet_type="multi_stage_pointnet",
-            point_downsample=False,
+            point_downsample=True,
         )
         obs_feature_dim = obs_encoder.output_shape()
         global_cond_dim = obs_feature_dim * config.n_obs_steps
@@ -266,15 +270,25 @@ class IDP3Model(nn.Module):
                 AND/OR
             "observation.environment_state": (B, environment_dim)
 
-            "observation.point_cloud": (B, n_obs_steps, num_points * 3/6)
+            "observation.pc_*": (B, n_obs_steps, num_points * 3/6)
                     }
         """
         batch_size, n_obs_steps = batch["observation.state"].shape[:2]
         assert n_obs_steps == self.config.n_obs_steps
 
         # Encode pointcloud features and concatenate them all together along with the state vector using mutli-stage pointnet encoder.
-        batch["observation.point_cloud"] = self.preprocess_pointcloud(
-            batch["observation.point_cloud"],
+        batch["observation.pc_h"] = self.preprocess_pointcloud(
+            batch["observation.pc_h"],
+            num_points=self.config.PointCloudEncoderConfig.num_points,
+            pc_channels=self.config.PointCloudEncoderConfig.in_channels,
+        )
+        batch["observation.pc_l"] = self.preprocess_pointcloud(
+            batch["observation.pc_l"],
+            num_points=self.config.PointCloudEncoderConfig.num_points,
+            pc_channels=self.config.PointCloudEncoderConfig.in_channels,
+        )
+        batch["observation.pc_r"] = self.preprocess_pointcloud(
+            batch["observation.pc_r"],
             num_points=self.config.PointCloudEncoderConfig.num_points,
             pc_channels=self.config.PointCloudEncoderConfig.in_channels,
         )
@@ -306,7 +320,7 @@ class IDP3Model(nn.Module):
                 AND/OR
             "observation.environment_state": (B, environment_dim)
 
-            "observation.point_cloud": (B, n_obs_steps, num_points * 3)
+            "observation.pc_*": (B, n_obs_steps, num_points * 3)
 
             "action": (B, horizon, action_dim)
             "action_is_pad": (B, horizon)
@@ -314,7 +328,9 @@ class IDP3Model(nn.Module):
         """
         # Input validation.
         assert set(batch).issuperset({"observation.state", "action", "action_is_pad"})
-        assert "observation.point_cloud" in batch
+        assert "observation.pc_h" in batch
+        assert "observation.pc_l" in batch
+        assert "observation.pc_r" in batch
 
         n_obs_steps = batch["observation.state"].shape[1]
         horizon = batch["action"].shape[1]
@@ -323,8 +339,18 @@ class IDP3Model(nn.Module):
         assert n_obs_steps == self.config.n_obs_steps
 
         # Encode point cloud features.
-        batch["observation.point_cloud"] = self.preprocess_pointcloud(
-            batch["observation.point_cloud"],
+        batch["observation.pc_h"] = self.preprocess_pointcloud(
+            batch["observation.pc_h"],
+            num_points=self.config.PointCloudEncoderConfig.num_points,
+            pc_channels=self.config.PointCloudEncoderConfig.in_channels,
+        )
+        batch["observation.pc_l"] = self.preprocess_pointcloud(
+            batch["observation.pc_l"],
+            num_points=self.config.PointCloudEncoderConfig.num_points,
+            pc_channels=self.config.PointCloudEncoderConfig.in_channels,
+        )
+        batch["observation.pc_r"] = self.preprocess_pointcloud(
+            batch["observation.pc_r"],
             num_points=self.config.PointCloudEncoderConfig.num_points,
             pc_channels=self.config.PointCloudEncoderConfig.in_channels,
         )

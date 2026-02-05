@@ -6,31 +6,31 @@ hydra:
     subdir: ${hydra:job.override_dirname}
 
 # Task/dataset
-task: "idp3_v2_no_rgb"
+task: "idp3_v3_no_rgb"
 method: "idp3"
 timestamp: ${now:%Y%m%d_%H%M%S}
 repoid: "lerobot/${task}"
-root: "/home/wushihan/data/Codes/kuavo_data_challenge_icra/datasets/kdc_data_pcd/Task1/lerobot"
+root: "/home/wushihan/data/Codes/kuavo_data_challenge_icra/datasets/mini_data_set/lerobot/lerobot"
 
 training:
   output_directory: "outputs/train/${task}/${method}"
   seed: 42
   max_epoch: 100
 
-  save_freq_epoch: 5
+  save_freq_epoch: 10
   log_freq: 1
   device: "cuda"
   accumulation_steps: 1
   ema_power: 0.75
 
-  batch_size: 64
-  num_workers: 4
+  batch_size: 32
+  num_workers: 32
   drop_last: false
 
   max_training_step: null
 
-  resume: true
-  resume_timestamp: "/home/wushihan/data/Codes/kuavo_data_challenge_icra/outputs/train/idp3_v2_no_rgb/idp3/run_20260126_110144"
+  resume: false
+  resume_timestamp: ""
 
   RGB_Augmenter:
     enable: True
