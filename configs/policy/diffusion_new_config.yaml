@@ -7,7 +7,7 @@ hydra:  # Hydra config directory, for parameter checking only
 
 
 task: "Task1"  # Custom task name. If using huggingface datasets instead of local dataset, please specify, such as pusht, aloha_sim_insertion_human etc.
-method: "siglip_local_new_spatialsoftmax"  # Custom method name
+method: "siglip_local_depth"  # Custom method name
 timestamp: ${now:%Y%m%d_%H%M%S}  # Auto-obtained timestamp
 # 训练时模型参数的保存目录在outputs/train/<task>/<method>/<timestamp>中
 repoid: "lerobot/${task}"  # Newer versions of lerobot require this, for lerobot reference only. Not actually used elsewhere.
@@ -171,7 +171,7 @@ policy:
 
     custom:  # Custom configs. Special adjustments based on the lerobot diffusion policy, including depth support. You may refer to related codes for details
       # support depth image
-      use_depth: false #true
+      use_depth: true #false
       depth_encoder_type: "DEPTH" #"RGBD"
       depth_backbone: resnet18
       use_separate_depth_encoder_per_camera: False

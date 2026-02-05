@@ -66,7 +66,7 @@ class EnhancedSpatialSoftmax(nn.Module):
             # 使用 GroupNorm 而不是 BatchNorm，因为机器人训练通常 Batch 很小
             layers.append(nn.GroupNorm(num_groups=min(8, num_kp), num_channels=num_kp))
         
-        layers.append(nn.ReLU()) # 强制过滤负向信号，只保留正面响应
+        # layers.append(nn.ReLU()) # 强制过滤负向信号，只保留正面响应
         self.feature_extractor = nn.Sequential(*layers)
 
         # 2. 空间 Dropout：强迫模型不要死磕某一个背景纹理
@@ -430,8 +430,8 @@ class SiglipRGBEncoder(nn.Module):
         self.grid_w = w // self.patch_size
         
         self.num_kp = config.spatial_softmax_num_keypoints
-        #self.pool = SpatialSoftmax([self.hidden_size, self.grid_h, self.grid_w], num_kp=self.num_kp)
-        self.pool = EnhancedSpatialSoftmax([self.hidden_size, self.grid_h, self.grid_w], num_kp=self.num_kp)
+        self.pool = SpatialSoftmax([self.hidden_size, self.grid_h, self.grid_w], num_kp=self.num_kp)
+        #self.pool = EnhancedSpatialSoftmax([self.hidden_size, self.grid_h, self.grid_w], num_kp=self.num_kp)
         
         self.feature_dim = self.num_kp * 2
         self.out = nn.Sequential(
@@ -478,7 +478,7 @@ class SiglipRGBEncoder(nn.Module):
                 self._debug_counter += 1
 
                 # 每 1000 次步绘制一次 (可以根据需要改回 10 或 100)
-                if self._debug_counter % 1000 == 0:
+                if self._debug_counter % 10000 == 0:
                     try:
                         import matplotlib.pyplot as plt
                         import os
