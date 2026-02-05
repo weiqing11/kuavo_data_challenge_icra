@@ -220,5 +220,6 @@ obs.png
 datasets/
 *.mp4
 *.ply
+*.png
 /zyh_tmp
 /discuss

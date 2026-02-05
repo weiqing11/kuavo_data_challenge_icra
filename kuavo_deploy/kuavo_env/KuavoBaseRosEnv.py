@@ -127,12 +127,13 @@ class KuavoBaseRosEnv(gym.Env):
         )
 
         # -------- Point cloud space --------
-        obs_spaces["observation.point_cloud"] = gym.spaces.Box(
-            low=-np.inf,
-            high=np.inf,
-            dtype=np.float32,
-            shape=(self.point_cloud_num_points, self.point_cloud_channels),
-        )
+        if self.need_point_cloud:
+            obs_spaces["observation.point_cloud"] = gym.spaces.Box(
+                low=-np.inf,
+                high=np.inf,
+                dtype=np.float32,
+                shape=(self.point_cloud_num_points, self.point_cloud_channels),
+            )
 
         self.observation_space = gym.spaces.Dict(obs_spaces)
 
