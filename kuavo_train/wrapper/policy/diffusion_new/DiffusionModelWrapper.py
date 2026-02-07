@@ -350,105 +350,71 @@ class DinoSiglipRGBEncoder(nn.Module):
 
 
 class SiglipRGBEncoder(nn.Module):
+    """SigLIP patch-token encoder with optional LoRA fine-tuning."""
     def __init__(self, config):
         super().__init__()
-        
-        # 1. 加载 SigLIP 骨干网络
-        model_name = config.siglip_model_name
-        self.siglip = SiglipVisionModel.from_pretrained(model_name)
-        
-        # === [新增] LoRA 配置 ===
-        # 检查配置中是否启用了 use_lora (建议在 config 里加这个开关)
+        self.config = config
+        self.mode = getattr(config, "vision_encoder_mode", "patches")
+        if self.mode != "patches":
+            raise ValueError(f"Unknown mode: {self.mode}")
+
+        self.siglip = SiglipVisionModel.from_pretrained(config.siglip_model_name)
         self.use_lora = getattr(config, "use_lora", False)
+        self.vision_freeze = getattr(config, "vision_freeze", True)
         
         if self.use_lora:
-            logger.info(f"🔧 Applying LoRA to SigLIP Backbone...")
-            # 针对 Vision Transformer 的常见 LoRA 配置
-            # target_modules 通常是 query, value, key, dense 等
-            # 对于 HF 的 SigLIP，通常层名包含 "q_proj", "v_proj"
-            peft_config = LoraConfig(
-                r=getattr(config, "lora_rank", 16),       # 秩，越大适应能力越强，显存越多
-                lora_alpha=getattr(config, "lora_alpha", 32), # 缩放系数，通常是 rank 的 2 倍
-                target_modules=["q_proj", "v_proj"],      # 只微调 Attention 的 Q 和 V
-                lora_dropout=0.05,
-                bias="none",
-                modules_to_save=[], # 这一项留空，我们不需要保存 classifier
-            )
-            
-            # 这行代码会自动冻结主干，只把 LoRA 层设为 requires_grad=True
-            self.siglip = get_peft_model(self.siglip, peft_config)
-            
-            # 打印可训练参数量，确认 LoRA 生效
-            #self.siglip.print_trainable_parameters()
-            
+            self._apply_lora(config)
+            self.vision_freeze = False  # 使用 LoRA 时不冻结
+        elif self.vision_freeze:
+            self._freeze_backbone()
         else:
-            # 原有的冻结逻辑
-            self.vision_freeze = getattr(config, "vision_freeze", True)
-            if self.vision_freeze:
-                self.siglip.requires_grad_(False)
-                self.siglip.eval()
+            self.siglip.train()
 
         self.hidden_size = self.siglip.config.hidden_size
         self.patch_size = self.siglip.config.patch_size
-        
-        # 2. 模式控制: 'spatial' (局部关键点) 或 'global' (全局向量)
-        self.mode = getattr(config, "vision_encoder_mode", "spatial") 
-        # self.vision_freeze = getattr(config, "vision_freeze", True)
-        
-        # if self.vision_freeze:
-        #     self.siglip.requires_grad_(False)
-        #     self.siglip.eval()
 
-        # 3. 根据模式初始化不同的 Head
-        if self.mode == "spatial":
-            self._init_spatial_head(config)
-        elif self.mode == "global":
-            self._init_global_head(config)
-        else:
-            raise ValueError(f"Unknown mode: {self.mode}")
+        self._init_patches_head(config)
 
-        # DEBUG
-        self.last_log_time = 0      # 上次保存图片的时间
-        self.log_interval = 600.0    # 设定间隔：1000 秒 (你可以随意改)
+    def _apply_lora(self, config):
+        peft_config = LoraConfig(
+            r=getattr(config, "lora_rank", 16),
+            lora_alpha=getattr(config, "lora_alpha", 32),
+            target_modules=["q_proj", "v_proj"],
+            lora_dropout=getattr(config, "lora_dropout", 0.05),
+            bias="none",
+        )
+        self.siglip = get_peft_model(self.siglip, peft_config)
+        logger.info("🔧 SigLIP LoRA enabled (r=%d, alpha=%d).", peft_config.r, peft_config.lora_alpha)
 
-    def _init_spatial_head(self, config):
-        """初始化空间特征提取分支 (SpatialSoftmax)"""
-        # 解析 H, W 以计算 grid
+    def _freeze_backbone(self):
+        self.siglip.requires_grad_(False)
+        self.siglip.eval()
+    
+    def _init_patches_head(self, config):
+        """
+        初始化 Patch Token 输出模式
+        输出形状: [B, Num_Patches, Projection_Dim]
+        """
         if config.resize_shape:
             h, w = config.resize_shape
-        elif config.crop_shape:
-            if isinstance(list(config.crop_shape)[0], (list, tuple)):
-                (x0, x1), (y0, y1) = config.crop_shape
-                h, w = x1 - x0, y1 - y0
-            else:
-                h, w = config.crop_shape
         else:
             first_shape = next(iter(config.image_features.values())).shape
             h, w = first_shape[1:]
-
+            
         self.grid_h = h // self.patch_size
         self.grid_w = w // self.patch_size
+        self.num_patches = self.grid_h * self.grid_w
         
-        self.num_kp = config.spatial_softmax_num_keypoints
-        self.pool = SpatialSoftmax([self.hidden_size, self.grid_h, self.grid_w], num_kp=self.num_kp)
-        #self.pool = EnhancedSpatialSoftmax([self.hidden_size, self.grid_h, self.grid_w], num_kp=self.num_kp)
+        # 2. 投影层：将 SigLip 的巨大维度 (768/1024) 降维到 Transformer 的维度 (如 384/512)
+        # 从 config 获取目标维度，默认使用 transformer_n_emb
+        target_dim = getattr(config, "transformer_n_emb", 384) 
+        self.feature_dim = target_dim # 输出给 DiT 的特征维度
+        self.proj = nn.Linear(self.hidden_size, self.feature_dim)
+        self.norm = nn.LayerNorm(self.feature_dim)
         
-        self.feature_dim = self.num_kp * 2
-        self.out = nn.Sequential(
-            nn.Linear(self.feature_dim, self.feature_dim),
-            nn.ReLU()
-        )
-
-    def _init_global_head(self, config):
-        """初始化全局特征投影分支"""
-        # 假设全局模式输出维度由 config 定义，或者沿用 num_kp * 2 保持接口一致
-        self.feature_dim = config.spatial_softmax_num_keypoints * 2
-        
-        self.projection = nn.Sequential(
-            nn.Linear(self.hidden_size, self.feature_dim),
-            nn.LayerNorm(self.feature_dim),
-            nn.ReLU()
-        )
+        logger.info(f"✅ SigLip initialized in [Patches] mode. "
+                    f"Grid: {self.grid_h}x{self.grid_w}={self.num_patches} patches. "
+                    f"Proj: {self.hidden_size}->{self.feature_dim}")
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         requires_grad = self.use_lora or (not self.vision_freeze)
@@ -456,111 +422,10 @@ class SiglipRGBEncoder(nn.Module):
         
         with context:
             outputs = self.siglip(x, interpolate_pos_encoding=True)
-            
-            if self.mode == "spatial":
-                # 提取 Patch Tokens: [B, N, D] -> [B, D, H, W]
-                last_hidden_state = outputs.last_hidden_state
-                B, N, D = last_hidden_state.shape
-                feat = last_hidden_state.view(B, self.grid_h, self.grid_w, D).permute(0, 3, 1, 2)
-                
-                # Spatial Softmax 提取坐标
-                kp = self.pool(feat) # [B, num_kp, 2]
-                
-                # ================== 2. DEBUG 可视化代码块 (多图版) ==================
-                # 变量映射：x -> input_img, feat -> feat_map, kp -> kps_coords
-                input_img = x
-                feat_map = feat
-                kps_coords = kp
 
-                # 初始化计数器
-                if not hasattr(self, "_debug_counter"):
-                    self._debug_counter = 0
-                self._debug_counter += 1
-
-                # 每 1000 次步绘制一次 (可以根据需要改回 10 或 100)
-                if self._debug_counter % 10000 == 0:
-                    try:
-                        import matplotlib.pyplot as plt
-                        import os
-                        import numpy as np
-                        import torch.nn.functional as F
-                        
-                        save_dir = "/home/liangweiqing/data/code/kuavo_data_challenge_icra/debug_visualizations"
-                        os.makedirs(save_dir, exist_ok=True)
-                        
-                        # 确定要可视化的数量 (最大取 3)
-                        num_vis = min(3, input_img.shape[0])
-                        
-                        # 创建画布：num_vis 行，4 列
-                        fig, axes = plt.subplots(num_vis, 4, figsize=(16, 4 * num_vis), dpi=100)
-                        
-                        # 如果只有 1 张图，axes 会是 1D array，将其统一为 2D 方便索引
-                        if num_vis == 1:
-                            axes = np.expand_dims(axes, axis=0)
-
-                        for i in range(num_vis):
-                            # --- 提取数据并转为 CPU ---
-                            img_t = input_img[i].detach().cpu()       # [3, H, W]
-                            feat_t = feat_map[i].detach().cpu()       # [C, Hf, Wf]
-                            kps_t = kps_coords[i].detach().cpu()      # [K, 2]
-
-                            # --- A. 还原原图 (自适应 min-max) ---
-                            img_vis = img_t.permute(1, 2, 0).numpy()
-                            img_min, img_max = img_vis.min(), img_vis.max()
-                            img_vis = (img_vis - img_min) / (img_max - img_min + 1e-8)
-                            img_vis = np.clip(img_vis, 0, 1)
-                            H, W = img_vis.shape[:2]
-
-                            # --- B. 特征图可视化 (平均通道) ---
-                            feat_vis = feat_t.mean(dim=0).numpy()
-
-                            # --- C. 热力图可视化 ---
-                            C, Hf, Wf = feat_t.shape
-                            heatmap = F.softmax(feat_t.view(C, -1), dim=1).view(C, Hf, Wf)
-                            heatmap_vis = heatmap.max(dim=0)[0].numpy()
-
-                            # --- D. 关键点坐标转换 ---
-                            kps_x = ((kps_t[:, 0] + 1) / 2 * W).numpy()
-                            kps_y = ((kps_t[:, 1] + 1) / 2 * H).numpy()
-
-                            # --- E. 绘图 ---
-                            # 1. 原图
-                            axes[i, 0].imshow(img_vis)
-                            axes[i, 0].set_title(f"Img {i} (Step {self._debug_counter})")
-                            axes[i, 0].axis('off')
-
-                            # 2. 特征图
-                            axes[i, 1].imshow(feat_vis, cmap='viridis')
-                            axes[i, 1].set_title("Feature Map (Mean)")
-                            axes[i, 1].axis('off')
-
-                            # 3. 热力图
-                            axes[i, 2].imshow(heatmap_vis, cmap='jet')
-                            axes[i, 2].set_title("Softmax Heatmap")
-                            axes[i, 2].axis('off')
-
-                            # 4. 关键点覆盖
-                            axes[i, 3].imshow(img_vis)
-                            axes[i, 3].scatter(kps_x, kps_y, c='r', s=15, marker='x', linewidths=1.0)
-                            axes[i, 3].set_title(f"Keypoints (N={len(kps_x)})")
-                            axes[i, 3].axis('off')
-
-                        plt.tight_layout()
-                        save_path = os.path.join(save_dir, f"new_spatialsoftmax_batch_{self._debug_counter}.png")
-                        plt.savefig(save_path)
-                        plt.close()
-
-                    except Exception as e:
-                        print(f"[DEBUG ERROR] {e}")
-                # ================== DEBUG END ==================
-
-                return self.out(torch.flatten(kp, start_dim=1))
-                
-            elif self.mode == "global":
-                # 提取 Pooler Output (SigLIP 的注意力池化结果): [B, D]
-                global_feat = outputs.pooler_output 
-                return self.projection(global_feat)
-
+        tokens = self.proj(outputs.last_hidden_state)   
+        
+        return tokens
 
 class DFomerRGBDBackbone(nn.Module):
     def __init__(self, config):
@@ -1004,99 +869,88 @@ class CustomDiffusionModelWrapper(DiffusionModel):
 
         self.config = config
         global_cond_dim = 0
-
+        vision_seq_len = 0
+        self.cond_feat_dim = getattr(self.config, "transformer_n_emb", 384)
+        
         # ---- state encoder in WRAPPER (only place for discrete or mlp logic) ----
         self.state_encoder = None
-        final_state_dim = None
+        state_seq_len = 0
         if getattr(self.config, "robot_state_feature", None) is not None:
             state_dim = self.config.robot_state_feature.shape[0]
             if getattr(self.config, "use_state_encoder", False):
-                out_dim = getattr(self.config, "state_feature_dim", 128)
+                out_dim = self.cond_feat_dim
                 self.state_encoder = FeatureEncoder(state_dim, out_dim)
-                final_state_dim = out_dim
-                global_cond_dim += final_state_dim
+                state_seq_len += 1
             else:
-                final_state_dim = state_dim
-                global_cond_dim += final_state_dim
+                logger.warning("Robot state feature provided but `use_state_encoder` is False. Using raw state as conditioning.")
 
         # ---- RGB encoders ----
-        self.rgb_feat_dim = 0
         if getattr(self.config, "image_features", None):
             num_images = len(self.config.image_features)
             if getattr(self.config, "use_separate_rgb_encoder_per_camera", False):
                 encs = [DiffusionRgbEncoder(config) for _ in range(num_images)]
                 self.rgb_encoder = nn.ModuleList(encs)
-                feat_dim = encs[0].feature_dim
+                one_enc = encs[0].model
             else:
                 self.rgb_encoder = DiffusionRgbEncoder(config)
-                feat_dim = self.rgb_encoder.feature_dim
-            self.rgb_feat_dim = feat_dim * num_images
-            global_cond_dim += self.rgb_feat_dim
-            self.rgb_attn_layer = nn.MultiheadAttention(embed_dim=feat_dim, num_heads=getattr(self.config, "rgb_attn_heads", 8), batch_first=True)
-
-        # ---- Depth encoders (optional) ----
-        self.depth_feat_dim = 0     
-        # 1. 检查是否开启 Depth 模块
-        if getattr(self.config, "use_depth", False) and getattr(self.config, "depth_features", None):
-            self.depth_encoder_type = getattr(self.config, "depth_encoder_type", "DEPTH") # 默认为纯深度
+                one_enc = self.rgb_encoder.model
             
-            # 2. 根据配置决定实例化哪个类
-            if self.depth_encoder_type == "DEPTH":
-                # 对应纯深度编码器 (如 ResNet18)
-                EncoderClass = DiffusionDepthEncoder 
-            elif self.depth_encoder_type == "RGBD":
-                # 对应 RGBD 融合编码器 (如 DFormer)
-                EncoderClass = DiffusionRGBDEncoder
-            else:
-                raise ValueError(f"Unknown depth_encoder_type: {self.depth_encoder_type}")
+            patches_per_img = one_enc.num_patches
+            vision_seq_len = num_images * patches_per_img
 
-            num_depth = len(self.config.depth_features)
-
-            # 3. 实例化编码器 (支持 per_camera 独立权重或共享权重)
-            if getattr(self.config, "use_separate_depth_encoder_per_camera", False):
-                encs = [EncoderClass(config) for _ in range(num_depth)]
-                self.depth_encoder = nn.ModuleList(encs)
-                feat_dim = encs[0].feature_dim
-            else:
-                self.depth_encoder = EncoderClass(config)
-                feat_dim = self.depth_encoder.feature_dim
+        # # ---- Depth encoders (optional) ----
+        # self.depth_feat_dim = 0     
+        # # 1. 检查是否开启 Depth 模块
+        # if getattr(self.config, "use_depth", False) and getattr(self.config, "depth_features", None):
+        #     self.depth_encoder_type = getattr(self.config, "depth_encoder_type", "DEPTH") # 默认为纯深度
             
-            # 4. 更新全局维度和 Attention 层
-            self.depth_feat_dim = feat_dim * num_depth
-            global_cond_dim += self.depth_feat_dim
+        #     # 2. 根据配置决定实例化哪个类
+        #     if self.depth_encoder_type == "DEPTH":
+        #         # 对应纯深度编码器 (如 ResNet18)
+        #         EncoderClass = DiffusionDepthEncoder 
+        #     elif self.depth_encoder_type == "RGBD":
+        #         # 对应 RGBD 融合编码器 (如 DFormer)
+        #         EncoderClass = DiffusionRGBDEncoder
+        #     else:
+        #         raise ValueError(f"Unknown depth_encoder_type: {self.depth_encoder_type}")
+
+        #     num_depth = len(self.config.depth_features)
+
+        #     # 3. 实例化编码器 (支持 per_camera 独立权重或共享权重)
+        #     if getattr(self.config, "use_separate_depth_encoder_per_camera", False):
+        #         encs = [EncoderClass(config) for _ in range(num_depth)]
+        #         self.depth_encoder = nn.ModuleList(encs)
+        #         feat_dim = encs[0].feature_dim
+        #     else:
+        #         self.depth_encoder = EncoderClass(config)
+        #         feat_dim = self.depth_encoder.feature_dim
             
-            # 初始化 Attention
-            self.depth_attn_layer = nn.MultiheadAttention(
-                embed_dim=feat_dim, 
-                num_heads=getattr(self.config, "depth_attn_heads", 8), 
-                batch_first=True
-            )
+        #     # 4. 更新全局维度和 Attention 层
+        #     self.depth_feat_dim = feat_dim * num_depth
+        #     global_cond_dim += self.depth_feat_dim
+            
+        #     # 初始化 Attention
+        #     self.depth_attn_layer = nn.MultiheadAttention(
+        #         embed_dim=feat_dim, 
+        #         num_heads=getattr(self.config, "depth_attn_heads", 8), 
+        #         batch_first=True
+        #     )
 
-            # 初始化多模态融合层
-            self.multimodalfuse = nn.ModuleDict({
-                "rgb_q": nn.MultiheadAttention(embed_dim=feat_dim, num_heads=getattr(self.config, "multimodal_heads", 8), batch_first=True),
-                "depth_q": nn.MultiheadAttention(embed_dim=feat_dim, num_heads=getattr(self.config, "multimodal_heads", 8), batch_first=True),
-            })
+        #     # 初始化多模态融合层
+        #     self.multimodalfuse = nn.ModuleDict({
+        #         "rgb_q": nn.MultiheadAttention(embed_dim=feat_dim, num_heads=getattr(self.config, "multimodal_heads", 8), batch_first=True),
+        #         "depth_q": nn.MultiheadAttention(embed_dim=feat_dim, num_heads=getattr(self.config, "multimodal_heads", 8), batch_first=True),
+        #     })
 
-        # ---- state-guided fusion block ----
-        self.fusion_hidden = getattr(self.config, "fusion_hidden_dim", 256)
-        self.state_guided = None
-        if getattr(self.config, "state_fuse", False):
-            vis_dim_for_fusion = (self.rgb_attn_layer.embed_dim if hasattr(self, "rgb_attn_layer") else self.rgb_feat_dim)
-            dep_dim_for_fusion = (self.depth_attn_layer.embed_dim if hasattr(self, "depth_attn_layer") else None)
-            state_dim_for_fusion = final_state_dim
-            self.state_guided = StateGuidedFusionBlock(
-                vis_dim=vis_dim_for_fusion,
-                dep_dim=dep_dim_for_fusion,
-                state_dim=state_dim_for_fusion,
-                hidden_dim=self.fusion_hidden,
-                num_heads=getattr(self.config, "fusion_heads", 8)
-            )
-            global_cond_dim += self.fusion_hidden
+        # ---- 计算 DiT 需要的总 Context 长度 ----
+        # 比如：2步历史 * (196个视觉Token + 1个状态Token) = 394 个 Token
+        tokens_per_step = vision_seq_len + state_seq_len
+        total_cond_len = self.config.n_obs_steps * tokens_per_step
 
-        # ---- env state ----
-        if getattr(self.config, "env_state_feature", None) is not None:
-            global_cond_dim += self.config.env_state_feature.shape[0]
+        logger.info(f"🚀 DiT Context Setup")
+        logger.info(f"   Per Step: {vision_seq_len} Vision Tokens + {state_seq_len} State Tokens")
+        logger.info(f"   Total Context Length: {total_cond_len} (over {self.config.n_obs_steps} steps)")
+        logger.info(f"   Embedding Dim: {self.cond_feat_dim}")
 
         # ---- core diffusion model ----
         if config.use_unet:
@@ -1106,8 +960,8 @@ class CustomDiffusionModelWrapper(DiffusionModel):
                 input_dim=config.output_features["action"].shape[0],
                 output_dim=config.output_features["action"].shape[0],
                 horizon=config.horizon,
-                n_obs_steps=config.n_obs_steps,
-                cond_dim=global_cond_dim,
+                n_obs_steps=total_cond_len,
+                cond_dim=self.cond_feat_dim,
                 n_layer=self.config.transformer_n_layer,
                 n_head=self.config.transformer_n_head,
                 n_emb=self.config.transformer_n_emb,
@@ -1149,83 +1003,65 @@ class CustomDiffusionModelWrapper(DiffusionModel):
         """
         B = batch[OBS_STATE].shape[0]
         S = batch[OBS_STATE].shape[1]  # n_obs_steps
-        feats = []
+        tokens_list = []
 
         # ---------- RGB ----------
-        img_features = None  # tokens shape (B*S, N_cam_tokens, feat)
         if getattr(self.config, "image_features", None):
             if getattr(self.config, "use_separate_rgb_encoder_per_camera", False):
                 imgs = einops.rearrange(batch[OBS_IMAGES], "b s n ... -> n (b s) ...")
                 enc_outs = [enc(im) for enc, im in zip(self.rgb_encoder, imgs)]
-                img_cat = torch.cat(enc_outs)  # (n * B*s, feat)
-                img_features = einops.rearrange(img_cat, "(n b s) f -> (b s) n f", b=B, s=S)
+                vis_feats = torch.cat(enc_outs)  # (n * B*s, feat)
             else:
                 imgs = einops.rearrange(batch[OBS_IMAGES], "b s n ... -> (b s n) ...")
-                out = self.rgb_encoder(imgs)  # (b*s*n, feat)
-                img_features = einops.rearrange(out, "(b s n) f -> (b s) n f", b=B, s=S)
-            # self-attn over tokens
-            img_features = self.rgb_attn_layer(img_features, img_features, img_features)[0]  # (b*s, n, feat)
-
-        # ---------- Depth / RGBD (Modified) ----------
-        depth_features = None
-        # 1. 检查是否开启 Depth，且数据中存在 Depth
-        if getattr(self.config, "use_depth", False) and getattr(self.config, "depth_features", None) and (OBS_DEPTH in batch):
-            # 2. 判断当前模式: 'rgbd' (DFormer) 还是 'depth' (ResNet)
-            # 默认为 'depth' 以兼容旧 Config
-            encoder_mode = getattr(self, "depth_encoder_type", "DEPTH") 
-
-            if getattr(self.config, "use_separate_depth_encoder_per_camera", False):
-                # === Case A: 每个摄像头独立 Encoder ===
-                # 准备 Depth 数据: [B, S, N, ...] -> [N, B*S, ...]
-                depths_by_cam = einops.rearrange(batch[OBS_DEPTH], "b s n ... -> n (b s) ...")
-                
-                if encoder_mode == "RGBD":
-                    # RGBD 模式：需要同时准备 RGB 数据，形状必须完全对齐
-                    imgs_by_cam = einops.rearrange(batch[OBS_IMAGES], "b s n ... -> n (b s) ...")
-                    # 传入 (rgb, depth)
-                    enc_outs = [enc(im, d) for enc, im, d in zip(self.depth_encoder, imgs_by_cam, depths_by_cam)]
-                else:
-                    # 纯 Depth 模式：只传 depth
-                    enc_outs = [enc(d) for enc, d in zip(self.depth_encoder, depths_by_cam)]
-                
-                dep_cat = torch.cat(enc_outs)
-                depth_features = einops.rearrange(dep_cat, "(n b s) f -> (b s) n f", b=B, s=S)
+                vis_feats = self.rgb_encoder(imgs)  # [B*S*N_cam, N_Patches, Feat_Dim] (Patches)
             
-            else:
-                # === Case B: 共享 Encoder ===
-                # 准备 Depth 数据: [B, S, N, ...] -> [B*S*N, ...]
-                depths_flat = einops.rearrange(batch[OBS_DEPTH], "b s n ... -> (b s n) ...")
-                
-                if encoder_mode == "RGBD":
-                    # RGBD 模式：获取 RGB 数据
-                    imgs_flat = einops.rearrange(batch[OBS_IMAGES], "b s n ... -> (b s n) ...")
-                    # 传入 (rgb, depth)
-                    out = self.depth_encoder(imgs_flat, depths_flat)
-                else:
-                    # 纯 Depth 模式
-                    out = self.depth_encoder(depths_flat)
-                
-                depth_features = einops.rearrange(out, "(b s n) f -> (b s) n f", b=B, s=S)
+            # 目标: [B, S, (N_cam * N_Patches), D]
+            vis_tokens = einops.rearrange(vis_feats, "(b s n) p d -> b s (n p) d", b=B, s=S)
+            tokens_list.append(vis_tokens)
+        
+        # # ---------- Depth / RGBD (Modified) ----------
+        # depth_features = None
+        # # 1. 检查是否开启 Depth，且数据中存在 Depth
+        # if getattr(self.config, "use_depth", False) and getattr(self.config, "depth_features", None) and (OBS_DEPTH in batch):
+        #     # 2. 判断当前模式: 'rgbd' (DFormer) 还是 'depth' (ResNet)
+        #     # 默认为 'depth' 以兼容旧 Config
+        #     encoder_mode = getattr(self, "depth_encoder_type", "DEPTH") 
 
-            # 3. Apply Self-Attention
-            depth_features = self.depth_attn_layer(depth_features, depth_features, depth_features)[0]  # (b*s, n, feat)
+        #     if getattr(self.config, "use_separate_depth_encoder_per_camera", False):
+        #         # === Case A: 每个摄像头独立 Encoder ===
+        #         # 准备 Depth 数据: [B, S, N, ...] -> [N, B*S, ...]
+        #         depths_by_cam = einops.rearrange(batch[OBS_DEPTH], "b s n ... -> n (b s) ...")
+                
+        #         if encoder_mode == "RGBD":
+        #             # RGBD 模式：需要同时准备 RGB 数据，形状必须完全对齐
+        #             imgs_by_cam = einops.rearrange(batch[OBS_IMAGES], "b s n ... -> n (b s) ...")
+        #             # 传入 (rgb, depth)
+        #             enc_outs = [enc(im, d) for enc, im, d in zip(self.depth_encoder, imgs_by_cam, depths_by_cam)]
+        #         else:
+        #             # 纯 Depth 模式：只传 depth
+        #             enc_outs = [enc(d) for enc, d in zip(self.depth_encoder, depths_by_cam)]
+                
+        #         dep_cat = torch.cat(enc_outs)
+        #         depth_features = einops.rearrange(dep_cat, "(n b s) f -> (b s) n f", b=B, s=S)
+            
+        #     else:
+        #         # === Case B: 共享 Encoder ===
+        #         # 准备 Depth 数据: [B, S, N, ...] -> [B*S*N, ...]
+        #         depths_flat = einops.rearrange(batch[OBS_DEPTH], "b s n ... -> (b s n) ...")
+                
+        #         if encoder_mode == "RGBD":
+        #             # RGBD 模式：获取 RGB 数据
+        #             imgs_flat = einops.rearrange(batch[OBS_IMAGES], "b s n ... -> (b s n) ...")
+        #             # 传入 (rgb, depth)
+        #             out = self.depth_encoder(imgs_flat, depths_flat)
+        #         else:
+        #             # 纯 Depth 模式
+        #             out = self.depth_encoder(depths_flat)
+                
+        #         depth_features = einops.rearrange(out, "(b s n) f -> (b s) n f", b=B, s=S)
 
-        # ---------- RGB <-> Depth fusion (if both exist) ----------
-        # Keep both token forms (rgb_q_tokens, dep_q_tokens) for state-guided fusion (we will concat them).
-        rgb_q_tokens = None
-        dep_q_tokens = None
-        if (img_features is not None) and (depth_features is not None) and hasattr(self, "multimodalfuse"):
-            rgb_q_tokens = self.multimodalfuse["rgb_q"](img_features, depth_features, depth_features)[0]  # (b*s, n, feat)
-            dep_q_tokens = self.multimodalfuse["depth_q"](depth_features, img_features, img_features)[0]  # (b*s, n, feat)
-            # For global_cond feats we flatten (B, S, n*feat)
-            rgb_q_flat = einops.rearrange(rgb_q_tokens, "(b s) n f -> b s (n f)", b=B, s=S)
-            dep_q_flat = einops.rearrange(dep_q_tokens, "(b s) n f -> b s (n f)", b=B, s=S)
-            feats.extend([rgb_q_flat, dep_q_flat])
-        elif img_features is not None:
-            # only rgb available
-            feats.append(einops.rearrange(img_features, "(b s) n f -> b s (n f)", b=B, s=S))
-        elif depth_features is not None:
-            feats.append(einops.rearrange(depth_features, "(b s) n f -> b s (n f)", b=B, s=S))
+        #     # 3. Apply Self-Attention
+        #     depth_features = self.depth_attn_layer(depth_features, depth_features, depth_features)[0]  # (b*s, n, feat)
 
         # ---------- State encoding (WRAPPER does this) ----------
         state_tensor = None
@@ -1234,59 +1070,17 @@ class CustomDiffusionModelWrapper(DiffusionModel):
             if self.state_encoder is not None:
                 # encoder may accept (B, S, D) and returns (B, S, out_dim)
                 state_emb = self.state_encoder(state_tensor)  # (B, S, final_state_dim)
-                feats.append(state_emb)
-            else:
-                feats.append(state_tensor)
+                state_tokens = state_emb.unsqueeze(2)  # (B, S, 1, final_state_dim)
+                tokens_list.append(state_tokens)
 
-        # ---------- Env state ----------
-        if getattr(self.config, "env_state_feature", None) is not None:
-            feats.append(batch[OBS_ENV_STATE])
+        combined = torch.cat(tokens_list, dim=2)  # (B, S, total_tokens, D)
 
-        # ---------- State-guided fusion: run on per-(b*s) samples ----------
-        if getattr(self, "state_guided", None) is not None:
-            # prepare tokens for fusion block
-            # choose tokens: if rgb_q_tokens & dep_q_tokens exist -> concat them (combined tokens),
-            # else fallback to img_features (or depth_features if only depth exists)
-            if (rgb_q_tokens is not None) and (dep_q_tokens is not None):
-                # concat tokens along sequence dim to give more information to fusion
-                # vis_tokens_for_fusion = torch.cat([rgb_q_tokens, dep_q_tokens], dim=1)  # (b*s, n_r + n_d, feat)
-                # vis_tokens_for_fusion = rgb_q_tokens
-                # dep_tokens_for_fusion = dep_q_tokens
-                vis_tokens_for_fusion = img_features
-                dep_tokens_for_fusion = depth_features
-                # print("~~~~~~~~~~~~~~~~~~~~~~~~~~use rgb_q and dep_q~~~~~~~~~~~~~~~~~~~~~~~~~~")
-            elif img_features is not None:
-                vis_tokens_for_fusion = img_features  # (b*s, n, feat)
-                dep_tokens_for_fusion = None
-            elif depth_features is not None:
-                vis_tokens_for_fusion = depth_features
-                dep_tokens_for_fusion = None
-            else:
-                vis_tokens_for_fusion = None
-                dep_tokens_for_fusion = None
+        # 4. 展平时间步 S
+        # 最终形状: [B, S * All_Tokens_Per_Step, D]
+        # DiT 会自动处理这个长序列的 Positional Embedding (因为它认为 length = n_obs_steps 参数)
+        global_cond = einops.rearrange(combined, "b s t d -> b (s t) d")
 
-            # prepare state for fusion: should be (B*s, final_state_dim) or None
-            if state_tensor is not None:
-                if self.state_encoder is not None:
-                    state_for_fusion = state_emb.view(B * S, -1)  # (B*S, final_state_dim)
-                else:
-                    state_for_fusion = state_tensor.view(B * S, -1)  # raw
-            else:
-                state_for_fusion = None
-
-            # call fusion block if we have visual tokens
-            if vis_tokens_for_fusion is not None:
-                fused_vec = self.state_guided(vis_tokens_for_fusion, dep_tokens_for_fusion, state_for_fusion)  # (B*s, fusion_hidden)
-                fused_vec = einops.rearrange(fused_vec, "(b s) f -> b s f", b=B, s=S)  # (B, S, fusion_hidden)
-                feats.append(fused_vec)
-
-        # Final concat -> (B, S, cond_dim)
-        if len(feats) == 0:
-            return torch.zeros((B, S, 0), device=next(self.parameters()).device)
-        if self.config.use_unet:
-            return torch.cat(feats, dim=-1).flatten(start_dim=1)
-        else:
-            return torch.cat(feats, dim=-1)
+        return global_cond
 
     # ---------------------------
     # Inference sampling
