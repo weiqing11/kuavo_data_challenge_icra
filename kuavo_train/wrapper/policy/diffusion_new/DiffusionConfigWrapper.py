@@ -35,7 +35,7 @@ class CustomDiffusionConfigWrapper(DiffusionConfig):
     vision_encoder_mode: str = None
     vision_attn_heads: int = None
     vision_fusion_dim: int = None
-    use_lora: str = None
+    use_lora: bool = None
     lora_rank: int = None
     lora_alpha: int = None
     # ==================================================

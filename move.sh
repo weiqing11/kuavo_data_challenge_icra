@@ -14,8 +14,8 @@ case $MODE in
         ;;
     "2")
         echo "使用配置 [2]: Task1 (baseline)"
-        SRC="/home/liangweiqing/data/code/kuavo_data_challenge_icra/outputs/train/base_Task1"
-        DEST="/home/agilex/liangweiqing/kdc/kuavo_data_challenge_icra/outputs/train"
+        SRC="/home/liangweiqing/data/code/kuavo_data_challenge_icra/outputs/train/Task1/siglip_patches"
+        DEST="/home/agilex/liangweiqing/kdc/kuavo_data_challenge_icra/outputs/train/Task1"
         ;;
     *)
         exit 1

@@ -1,5 +1,7 @@
 # multimodal_diffusion_wrapper.py
 import math
+from pathlib import Path
+from PIL import Image
 from typing import Optional, Dict, Any
 import einops
 import torch
@@ -8,7 +10,7 @@ from torch import Tensor
 import torchvision
 import torch.nn.functional as F
 
-from transformers import AutoModel, SiglipVisionModel
+from transformers import AutoModel, SiglipVisionModel, SiglipImageProcessor
 from kuavo_train.logger import logger, log_box, Colors
 
 from lerobot.utils.constants import OBS_ENV_STATE, OBS_IMAGES, OBS_STATE
@@ -359,9 +361,14 @@ class SiglipRGBEncoder(nn.Module):
             raise ValueError(f"Unknown mode: {self.mode}")
 
         self.siglip = SiglipVisionModel.from_pretrained(config.siglip_model_name)
+        self.processor = SiglipImageProcessor.from_pretrained(config.siglip_model_name)
         self.use_lora = getattr(config, "use_lora", False)
         self.vision_freeze = getattr(config, "vision_freeze", True)
         
+        self.processor_dump_dir = Path("/home/liangweiqing/data/code/kuavo_data_challenge_icra/tmp/siglip_debug")
+        self.processor_dump_dir.mkdir(parents=True, exist_ok=True)
+        self._dump_counter = 0
+
         if self.use_lora:
             self._apply_lora(config)
             self.vision_freeze = False  # 使用 LoRA 时不冻结
@@ -375,11 +382,32 @@ class SiglipRGBEncoder(nn.Module):
 
         self._init_patches_head(config)
 
+    def _dump_inputs_for_debug(self, imgs: torch.Tensor, max_save: int | None = None):
+        max_save = max_save or getattr(self.config, "siglip_debug_save_n", 4)
+        
+        # 1. 转为 CPU float
+        imgs_cpu = imgs.detach().cpu().float()
+        
+        # 2. 智能判断范围
+        # 如果虽然有点溢出但整体很小(<=2.0)，说明是 [0, 1] 范围，乘 255 还原
+        # 如果很大(>2.0)，说明已经是 [0, 255] 范围，无需操作
+        if imgs_cpu.max() <= 5.0:  
+            imgs_cpu = imgs_cpu * 255.0
+            
+        # 3. 关键修复：截断到 [0, 255]
+        # 解决"Deep Fried"过曝和噪点问题：防止 256 变成 0
+        imgs_to_save = torch.clamp(imgs_cpu, 0, 255).to(torch.uint8)
+
+        for idx in range(min(len(imgs_to_save), max_save)):
+            pil_img = Image.fromarray(imgs_to_save[idx].permute(1, 2, 0).numpy())
+            pil_img.save(self.processor_dump_dir / f"siglip_input_{self._dump_counter:06d}_{idx}.png")
+        self._dump_counter += 1
+
     def _apply_lora(self, config):
         peft_config = LoraConfig(
             r=getattr(config, "lora_rank", 16),
             lora_alpha=getattr(config, "lora_alpha", 32),
-            target_modules=["q_proj", "v_proj"],
+            target_modules=["q_proj", "k_proj", "v_proj", "out_proj", "fc1", "fc2"],
             lora_dropout=getattr(config, "lora_dropout", 0.05),
             bias="none",
         )
@@ -412,19 +440,29 @@ class SiglipRGBEncoder(nn.Module):
         self.proj = nn.Linear(self.hidden_size, self.feature_dim)
         self.norm = nn.LayerNorm(self.feature_dim)
         
-        logger.info(f"✅ SigLip initialized in [Patches] mode. "
-                    f"Grid: {self.grid_h}x{self.grid_w}={self.num_patches} patches. "
-                    f"Proj: {self.hidden_size}->{self.feature_dim}")
+        logger.info("SigLIP Vision Encoder initialized:")
+        logger.info(f"  - Model: {self.config.siglip_model_name}")
+        logger.info(f"  - SigLIP dim: {self.hidden_size}")
+        logger.info(f"  - Output dim: {self.feature_dim}")
+        logger.info(f"  - Image size: {h}x{w}")
+        logger.info(f"  - Num patches: {self.num_patches}")
+        logger.info(f"  - loRA: {'Enabled' if self.use_lora else 'Disabled'}")
+        logger.info(f"  - Frozen: {self.vision_freeze}")
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         requires_grad = self.use_lora or (not self.vision_freeze)
         context = torch.enable_grad() if requires_grad else torch.no_grad()
         
+        self._dump_inputs_for_debug(x)
+        x = x.to(torch.uint8)
+
         with context:
-            outputs = self.siglip(x, interpolate_pos_encoding=True)
+            x = self.processor(images=x, do_resize=False, do_rescale=False, return_tensors="pt")
+            outputs = self.siglip(x['pixel_values'].cuda(), interpolate_pos_encoding=True)
 
         tokens = self.proj(outputs.last_hidden_state)   
-        
+        tokens = self.norm(tokens)
+
         return tokens
 
 class DFomerRGBDBackbone(nn.Module):
