@@ -171,7 +171,7 @@ class IDP3Model(nn.Module):
             pc_channels=config.PointCloudEncoderConfig.in_channels,
             use_pc_color=False,
             pointnet_type="multi_stage_pointnet",
-            point_downsample=True,
+            point_downsample=False,
         )
         obs_feature_dim = obs_encoder.output_shape()
         global_cond_dim = obs_feature_dim * config.n_obs_steps
@@ -204,14 +204,28 @@ class IDP3Model(nn.Module):
         """
         # 如果是3维则需要展平为4维
         if point_cloud.dim() == 3:
+            raise ValueError("point cloud shape is ", point_cloud.shape)
             batch_size, current_steps, flattened_dim = point_cloud.shape
             # 计算输入数据的真实特征维度
             inferred_channels = flattened_dim // num_points
             point_cloud = point_cloud.reshape(batch_size, current_steps, num_points, inferred_channels)
         elif point_cloud.dim() == 4:
+            # raise ValueError("point cloud shape is ", point_cloud.shape) 32 2 8096 6
             inferred_channels = point_cloud.shape[-1]
-            if point_cloud.shape[2] != num_points:
-                raise ValueError(f"Input point cloud has {point_cloud.shape[2]} points, but expected {num_points}")
+            
+            current_points = point_cloud.shape[2]
+            if current_points > num_points:
+                # 【新增逻辑】如果点数多于目标点数，进行随机下采样
+                # 生成随机排列的索引，并取前 num_points 个
+                # device=point_cloud.device 确保索引生成在对应的 GPU/CPU 上
+                perm = torch.randperm(current_points, device=point_cloud.device)
+                indices = perm[:num_points]
+                # 应用索引，裁剪点云
+                point_cloud = point_cloud[:, :, indices, :]
+            elif current_points < num_points:
+                # 如果点数少于目标点数，依然报错（或者你可以选择 padding）
+                raise ValueError(f"Input point cloud has {current_points} points, but expected {num_points}")
+
         else:
             raise ValueError(f"Expected point_cloud to have 3 or 4 dimensions, got {point_cloud.dim()}")
 

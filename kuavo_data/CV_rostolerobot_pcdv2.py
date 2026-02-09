@@ -168,14 +168,13 @@ def create_empty_dataset(
         }
 
     for cam in ('h', 'l', 'r'):
-        for method in ('fps', 'random', 'voxel', 'normals', 'curvature'):
-            features[f"observation.pc_{cam}_{method}"] = {
-                "dtype": "float32",
-                "shape": (8192, 6),  # x,y,z,r,g,b
-                "names": [
-                    "x", "y", "z", "r", "g", "b"
-                ],
-            }
+        features[f"observation.pc_{cam}"] = {
+            "dtype": "float32",
+            "shape": (8192, 6),  # x,y,z,r,g,b
+            "names": [
+                "x", "y", "z", "r", "g", "b"
+            ],
+        }
 
     for cam in cameras:
         if 'depth' in cam:
@@ -407,9 +406,9 @@ def populate_dataset(
                 rgb_img = imgs_per_cam[rgb_key][i]
                 depth_img = imgs_per_cam[depth_key][i]
                 rgb_img, depth_img = resize_images(rgb_img, depth_img, 320, 240)
-                for method in ('fps', 'random', 'voxel', 'normals', 'curvature'):
-                    pcd_points = process_pcd_task1(rgb_img, depth_img, f"cam_{cam}", method)
-                    frame[f"observation.pc_{cam}_{method}"] = pcd_points
+                
+                pcd_points = process_pcd_task1(rgb_img, depth_img, f"cam_{cam}", 'fps')
+                frame[f"observation.pc_{cam}_{method}"] = pcd_points
 
             for idx, (camera, img_array) in enumerate(imgs_per_cam.items()):
                 if "depth" in camera:

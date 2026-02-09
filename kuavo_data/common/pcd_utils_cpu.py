@@ -7,8 +7,7 @@ import cv2
 # 随机选择点云采样方法
 def choose_method():
     methods = ['fps', 'random', 'voxel', 'normals', 'curvature']
-    return 'fps'
-    # return np.random.choice(methods)
+    return np.random.choice(methods)
 
 # 点云增强函数，输入numpy，输出numpy
 def augmentation(point_cloud, task_id, camera_id, target_points=4096):
