@@ -7,7 +7,7 @@ hydra:  # Hydra config directory, for parameter checking only
 
 
 task: "Task1"  # Custom task name. If using huggingface datasets instead of local dataset, please specify, such as pusht, aloha_sim_insertion_human etc.
-method: "siglip_local_depth"  # Custom method name
+method: "siglip_patches"  # Custom method name
 timestamp: ${now:%Y%m%d_%H%M%S}  # Auto-obtained timestamp
 # 训练时模型参数的保存目录在outputs/train/<task>/<method>/<timestamp>中
 repoid: "lerobot/${task}"  # Newer versions of lerobot require this, for lerobot reference only. Not actually used elsewhere.
@@ -24,11 +24,11 @@ training:
     save_freq_epoch: 5  # Training parameter save frequency. 10 epoch per saved weights
     log_freq: 1  # Progress bar refresh frequency. 1 = Every iteration step.
     device: "cuda" # Training device. Single GPU only by default. Systems with multiple GPU's please use CUDA_VISIBLE_DEVICES=6 as an envionment variable. cuda:6 might not work.
-    accumulation_steps: 4  # Grad accumulation step
+    accumulation_steps: 2  # Grad accumulation step
     ema_power: 0.75  # This parameter can be used if the EMA (Equation of Mobility) moving exponential average method is employed.
     # However, current testing shows that using EMA causes performance degradation, so it is no longer supported in the code.
 
-    batch_size: 8  # Batch size. Adjust as needed.
+    batch_size: 16  # Batch size. Adjust as needed.
     num_workers: 8  # dataloader's num_workers. Adjust as needed per your computer's performance. Setting it too high might lock up your computer
     drop_last: False  # Whether to drop the last incomplete batch
 
@@ -125,9 +125,9 @@ policy:
     siglip_model_name: "google/siglip2-base-patch16-224"
     DFormer_path: "/home/liangweiqing/data/models/DFormerv2_pretrained/DFormerv2/pretrained/DFormerv2_Small_pretrained.pth"
 
-    vision_encoder_mode: spatial #global
+    vision_encoder_mode: patches #spatial #global
     # === LoRA 配置 ===
-    use_lora: True           # 开启 LoRA
+    use_lora: False           # 开启 LoRA
     lora_rank: 16            # 推荐 8 或 16
     lora_alpha: 32           # 推荐 rank * 2
     vision_freeze: False  # 是否冻结模型参数
@@ -171,13 +171,13 @@ policy:
 
     custom:  # Custom configs. Special adjustments based on the lerobot diffusion policy, including depth support. You may refer to related codes for details
       # support depth image
-      use_depth: true #false
+      use_depth: false #false
       depth_encoder_type: "DEPTH" #"RGBD"
       depth_backbone: resnet18
       use_separate_depth_encoder_per_camera: False
 
       # resize and augmentation
-      resize_shape: [288, 384] #[224, 224] #[210, 280]  # [224, 368]
+      resize_shape: [192, 256] #[224, 224] #[210, 280]  # [224, 368]
 
       # state encoder.
       use_state_encoder: true
