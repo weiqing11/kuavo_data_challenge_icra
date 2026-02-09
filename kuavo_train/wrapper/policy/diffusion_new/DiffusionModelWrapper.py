@@ -25,6 +25,7 @@ from lerobot.policies.diffusion.modeling_diffusion import (
 )
 from kuavo_train.wrapper.policy.diffusion_new.transformer_diffusion import TransformerForDiffusion
 from kuavo_train.wrapper.policy.diffusion_new.DFormerv2 import DFormerv2_S, DFormerv2_B, DFormerv2_L
+from kuavo_train.wrapper.policy.diffusion_new.DiT_1D_AdaLN import DiT_S
 
 # diffusers scheduler classes (factory expects these names)
 from diffusers.schedulers.scheduling_ddim import DDIMScheduler
@@ -385,20 +386,19 @@ class SiglipRGBEncoder(nn.Module):
     def _dump_inputs_for_debug(self, imgs: torch.Tensor, max_save: int | None = None):
         max_save = max_save or getattr(self.config, "siglip_debug_save_n", 4)
         
-        # 1. 转为 CPU float
         imgs_cpu = imgs.detach().cpu().float()
         
-        # 2. 智能判断范围
-        # 如果虽然有点溢出但整体很小(<=2.0)，说明是 [0, 1] 范围，乘 255 还原
-        # 如果很大(>2.0)，说明已经是 [0, 255] 范围，无需操作
-        if imgs_cpu.max() <= 5.0:  
+        # 【修改】使用 mean 来判断，或者直接强制乘 255（如果你确信输入总是 [0,1]）
+        # 只要均值很小（比如小于 10），就认为需要缩放。这比 max() 更抗噪。
+        if imgs_cpu.mean() <= 10.0:   
             imgs_cpu = imgs_cpu * 255.0
             
-        # 3. 关键修复：截断到 [0, 255]
-        # 解决"Deep Fried"过曝和噪点问题：防止 256 变成 0
         imgs_to_save = torch.clamp(imgs_cpu, 0, 255).to(torch.uint8)
 
         for idx in range(min(len(imgs_to_save), max_save)):
+            # 注意：LeRobot 读入通常是 RGB，SigLIP 也需要 RGB
+            # Image.fromarray 默认处理 RGB，不需要 permute 通道顺序（除非原图是 BGR）
+            # 但 PyTorch Tensor 是 (C, H, W)，需要 permute 到 (H, W, C) 给 PIL
             pil_img = Image.fromarray(imgs_to_save[idx].permute(1, 2, 0).numpy())
             pil_img.save(self.processor_dump_dir / f"siglip_input_{self._dump_counter:06d}_{idx}.png")
         self._dump_counter += 1
@@ -453,8 +453,7 @@ class SiglipRGBEncoder(nn.Module):
         requires_grad = self.use_lora or (not self.vision_freeze)
         context = torch.enable_grad() if requires_grad else torch.no_grad()
         
-        self._dump_inputs_for_debug(x)
-        x = x.to(torch.uint8)
+        # self._dump_inputs_for_debug(x)
 
         with context:
             x = self.processor(images=x, do_resize=False, do_rescale=False, return_tensors="pt")
@@ -1010,6 +1009,14 @@ class CustomDiffusionModelWrapper(DiffusionModel):
                 obs_as_cond=True,
                 n_cond_layers=0,
             )
+        elif config.use_dit:
+            self.unet = DiT_S(
+                action_dim=config.output_features["action"].shape[0],
+                action_seq_len=config.horizon,
+                n_obs_steps=self.config.n_obs_steps,
+                token_dim=self.cond_feat_dim,
+                max_image_tokens=vision_seq_len      
+            )
         else:
             raise ValueError("Either `use_unet` or `use_transformer` must be True in config.")
 
@@ -1116,8 +1123,9 @@ class CustomDiffusionModelWrapper(DiffusionModel):
         # 4. 展平时间步 S
         # 最终形状: [B, S * All_Tokens_Per_Step, D]
         # DiT 会自动处理这个长序列的 Positional Embedding (因为它认为 length = n_obs_steps 参数)
-        global_cond = einops.rearrange(combined, "b s t d -> b (s t) d")
-
+        #global_cond = einops.rearrange(combined, "b s t d -> b (s t) d")
+        global_cond = combined
+        
         return global_cond
 
     # ---------------------------
