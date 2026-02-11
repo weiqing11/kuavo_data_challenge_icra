@@ -24,16 +24,16 @@ training:
   ema_power: 0.75
 
   batch_size: 32
-  num_workers: 8 #不能开太高，其会将数据集复制num_workers份到内存里，如果数据集大小为36G，它就会复制36*num_workersG的数据到内存里
+  num_workers: 6 # 不能开太高，过多处理数据的worker会导致系统内存占用过高，甚至崩溃
   drop_last: false
 
   max_training_step: null
 
-  resume: false
-  resume_timestamp: ""
+  resume: True
+  resume_timestamp: "/home/wushihan/data/Codes/kuavo_data_challenge_icra/outputs/train/idp3_3v_no_rgb/idp3/run_20260209_181638"
 
   RGB_Augmenter:
-    enable: True
+    enable: False # 点云不需要用到RGB数据增强
     max_num_transforms: 1
     random_order: True
     tfs:
@@ -80,7 +80,7 @@ policy:
 
   # Point cloud encoder
   pointcloud_encoder_cfg:
-    in_channels: 3
+    in_channels: 6
     out_channels: 128
     use_layernorm: true
     final_norm: "layernorm"

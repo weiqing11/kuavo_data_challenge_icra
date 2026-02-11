@@ -17,7 +17,7 @@ import torch
 from torchvision.transforms.functional import to_tensor
 from kuavo_deploy.utils.obs_buffer import ObsBuffer
 from kuavo_deploy.utils.signal_controller import ControlSignalManager
-from kuavo_data.common.pcd_utils import process_pcd_task1
+from kuavo_data.common.pcd_utils_cpu import process_pcd_task1
 
 
 log_robot = setup_logger("robot")
@@ -70,12 +70,22 @@ class KuavoBaseRosEnv(gym.Env):
         self.ratio = config_kuavo_env.ratio
         self.frame_alignment = config_kuavo_env.frame_alignment
 
-        # 新增的处理点云的信息
-        self.point_cloud_num_points = 4096
-        self.point_cloud_channels = 6
-        self.point_cloud_rgb_key = "head_cam_h"
-        self.point_cloud_depth_key = "depth_h"
+        # 新增的处理point_cloud的信息
         self.need_point_cloud = config_kuavo_inference.need_point_cloud
+        if self.need_point_cloud:
+            self.point_cloud_num_points = getattr(config_kuavo_inference, "point_cloud_num_points")
+            self.point_cloud_channels = getattr(config_kuavo_inference, "point_cloud_channels")
+            self.point_cloud_key_map = getattr(config_kuavo_inference, "point_cloud_keys")
+            # 预先计算输出 key 的映射 (例如: head_cam_h -> observation.pc_h)
+            self.pc_output_map = {}
+            for rgb_key in self.point_cloud_key_map.keys():
+                if 'head' in rgb_key or '_h' in rgb_key:
+                    self.pc_output_map[rgb_key] = ('observation.pc_h', 'cam_h')
+                elif 'left' in rgb_key or '_l' in rgb_key:
+                    self.pc_output_map[rgb_key] = ('observation.pc_l', 'cam_l')
+                elif 'right' in rgb_key or '_r' in rgb_key:
+                    self.pc_output_map[rgb_key] = ('observation.pc_r', 'cam_r')
+            self.point_cloud_method = getattr(config_kuavo_inference, "point_cloud_method")
 
     def _set_observation_space(self):
         limits = self.limits
@@ -128,12 +138,13 @@ class KuavoBaseRosEnv(gym.Env):
 
         # -------- Point cloud space --------
         if self.need_point_cloud:
-            obs_spaces["observation.point_cloud"] = gym.spaces.Box(
-                low=-np.inf,
-                high=np.inf,
-                dtype=np.float32,
-                shape=(self.point_cloud_num_points, self.point_cloud_channels),
-            )
+            for _, (out_key, _) in self.pc_output_map.items():
+                obs_spaces[out_key] = gym.spaces.Box(
+                    low=-np.inf,
+                    high=np.inf,
+                    dtype=np.float32,
+                    shape=(self.point_cloud_num_points, self.point_cloud_channels),
+                )
 
         self.observation_space = gym.spaces.Dict(obs_spaces)
 
@@ -524,23 +535,37 @@ class KuavoBaseRosEnv(gym.Env):
             # 检查 ObsBuffer 是否被修改（是否存在 raw 属性）
             if not hasattr(self.obs_buffer, 'raw_rgb_frames') or not hasattr(self.obs_buffer, 'raw_depth_frames'):
                 raise RuntimeError("ObsBuffer is missing raw frame storage! Please update obs_buffer.py.")
-            rgb_key = self.point_cloud_rgb_key
-            depth_key = self.point_cloud_depth_key
-            # 从缓存获取数据
-            rgb_frame = self.obs_buffer.raw_rgb_frames.get(rgb_key)
-            depth_frame = self.obs_buffer.raw_depth_frames.get(depth_key)
-            if rgb_frame is None:
-                raise ValueError(f"Point Cloud Error: Raw RGB frame not found for key '{rgb_key}'. Waiting for callback?")
-            if depth_frame is None:
-                raise ValueError(f"Point Cloud Error: Raw Depth frame not found for key '{depth_key}'. Waiting for callback?")
-
-            pcd_array = process_pcd_task1(rgb_frame, depth_frame)
-            if pcd_array is None:
-                raise ValueError("Point Cloud Error: process_pcd_task1 returned None!")
-
-            obs["observation.point_cloud"] = torch.from_numpy(pcd_array).float().unsqueeze(0)
-        else:
-            pass
+            for rgb_key, depth_key in self.point_cloud_key_map.items():
+                out_key, camera_id = self.pc_output_map[rgb_key]
+                rgb_frame = self.obs_buffer.raw_rgb_frames.get(rgb_key)
+                depth_frame = self.obs_buffer.raw_depth_frames.get(depth_key)
+                if rgb_frame is None:
+                    raise ValueError(f"Point Cloud Error: Missing RGB frame for {rgb_key}. Waiting for callback?")
+                if depth_frame is None:
+                    raise ValueError(f"Point Cloud Error: Missing Depth frame for {depth_key}. Waiting for callback?")
+                pcd_array = process_pcd_task1(
+                    rgb_frame, 
+                    depth_frame, 
+                    camera_id=camera_id, 
+                    method=self.point_cloud_method,
+                    target_points=self.point_cloud_num_points
+                )
+                # 将生成的点云调整为config中指定的大小
+                target_points = self.point_cloud_num_points
+                target_channels = self.point_cloud_channels
+                cur_points, cur_channels = pcd_array.shape
+                # 调整点的数量
+                if cur_points > target_points:
+                    idx = np.random.choice(cur_points, target_points, replace=False)
+                    pcd_array = pcd_array[idx]
+                elif cur_points < target_points:
+                    raise ValueError(f"Point Cloud Error: Not enough points in the point cloud! Got {cur_points}, but expected {target_points}.")
+                # 调整通道数量
+                if cur_channels > target_channels:
+                    pcd_array = pcd_array[:, :target_channels]
+                elif cur_channels < target_channels:
+                    raise ValueError(f"Point Cloud Error: Not enough channels in the point cloud! Got {cur_channels}, but expected {target_channels}.")
+                obs[out_key] = torch.from_numpy(pcd_array).float().unsqueeze(0)
         
         return obs
 

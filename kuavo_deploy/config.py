@@ -161,7 +161,16 @@ class ConfigInference:
     epoch: int = 1
     max_episode_steps: int = 1000
     env_name: str = "Kuavo-Sim"
+    # 点云配置
     need_point_cloud: bool = False
+    point_cloud_num_points: int = 4096
+    point_cloud_channels: int = 6
+    point_cloud_keys: Dict[str, str] = field(default_factory=lambda: {
+        'head_cam_h': 'depth_h', 
+        'wrist_cam_l': 'depth_l', 
+        'wrist_cam_r': 'depth_r'
+    })
+    point_cloud_method : str = "fps"
 
     def validate(self):
         if self.policy_type not in ["diffusion", "act", "idp3"]:

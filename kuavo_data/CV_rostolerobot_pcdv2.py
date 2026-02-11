@@ -15,7 +15,7 @@ ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT_DIR not in sys.path:
     sys.path.insert(0, ROOT_DIR)
 import kuavo_data.common.kuavo_dataset as kuavo
-from kuavo_data.common.pcd_utils_cpu import resize_images, process_pcd_task1
+from kuavo_data.common.pcd_utils_cpu import process_pcd_task1
 
 logging.basicConfig(
     level="DEBUG",
@@ -170,7 +170,7 @@ def create_empty_dataset(
     for cam in ('h', 'l', 'r'):
         features[f"observation.pc_{cam}"] = {
             "dtype": "float32",
-            "shape": (8192, 6),  # x,y,z,r,g,b
+            "shape": (4096, 6),  # x,y,z,r,g,b
             "names": [
                 "x", "y", "z", "r", "g", "b"
             ],
@@ -405,10 +405,8 @@ def populate_dataset(
                     raise ValueError(f"Unknown camera: {cam}")
                 rgb_img = imgs_per_cam[rgb_key][i]
                 depth_img = imgs_per_cam[depth_key][i]
-                rgb_img, depth_img = resize_images(rgb_img, depth_img, 320, 240)
-                
                 pcd_points = process_pcd_task1(rgb_img, depth_img, f"cam_{cam}", 'fps')
-                frame[f"observation.pc_{cam}_{method}"] = pcd_points
+                frame[f"observation.pc_{cam}"] = pcd_points
 
             for idx, (camera, img_array) in enumerate(imgs_per_cam.items()):
                 if "depth" in camera:

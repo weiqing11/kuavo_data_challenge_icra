@@ -243,7 +243,9 @@ def convert_numpy_to_o3d(np_pcd):
     return pcd
 
 # 任务1 点云处理流水线
-def process_pcd_task1(rgb_img, depth_img, camera_id, method, fov_deg=60.0):
+def process_pcd_task1(rgb_img, depth_img, camera_id, method, target_points=4096, fov_deg=60.0):
+    # 修改图像大小为原来1/2
+    rgb_img, depth_img = resize_images(rgb_img, depth_img, rgb_img.shape[1]//2, rgb_img.shape[0]//2)
     # fov_deg: 水平视场角，默认为 60 度
     h, w = depth_img.shape
     fov_rad = np.deg2rad(fov_deg)
@@ -268,7 +270,7 @@ def process_pcd_task1(rgb_img, depth_img, camera_id, method, fov_deg=60.0):
                             remove_outliers=True)
     # 统一点云数量
     pcd = resize_point_cloud_o3d(pcd=pcd, 
-                                 target_points=8192, 
+                                 target_points=target_points, 
                                  method=method)
     # 返回处理后的点云
     return convert_o3d_to_numpy(pcd=pcd)

@@ -168,7 +168,7 @@ class IDP3Model(nn.Module):
         obs_encoder = IDP3Encoder(
             observation_space=config.obs_dict,
             pointcloud_encoder_cfg=config.pointcloud_encoder_cfg,
-            pc_channels=config.PointCloudEncoderConfig.in_channels,
+            pc_channels=config.pointcloud_encoder_cfg.in_channels,
             use_pc_color=False,
             pointnet_type="multi_stage_pointnet",
             point_downsample=False,
@@ -196,38 +196,27 @@ class IDP3Model(nn.Module):
 
     def preprocess_pointcloud(self, point_cloud: Tensor, num_points: int = 4096, pc_channels: int = 3) -> Tensor:
         """
-        将扁平化的点云数据重塑为 (B * T, N, C) 格式。
-        参数:   pointcloud: 形状为 (B, T, N*C) 的张量/形状为 (B, T, N, C) 的张量
+        参数:   pointcloud: 形状为 (B, T, N, C) 的张量
                 num_points: 点的数量 N
                 pc_channels: 每个点的通道数 C
         返回: 重塑后的张量，形状为 (B * T, N, C)
         """
         # 如果是3维则需要展平为4维
-        if point_cloud.dim() == 3:
+        if point_cloud.dim() != 4:
             raise ValueError("point cloud shape is ", point_cloud.shape)
-            batch_size, current_steps, flattened_dim = point_cloud.shape
-            # 计算输入数据的真实特征维度
-            inferred_channels = flattened_dim // num_points
-            point_cloud = point_cloud.reshape(batch_size, current_steps, num_points, inferred_channels)
-        elif point_cloud.dim() == 4:
-            # raise ValueError("point cloud shape is ", point_cloud.shape) 32 2 8096 6
-            inferred_channels = point_cloud.shape[-1]
-            
-            current_points = point_cloud.shape[2]
-            if current_points > num_points:
-                # 【新增逻辑】如果点数多于目标点数，进行随机下采样
-                # 生成随机排列的索引，并取前 num_points 个
-                # device=point_cloud.device 确保索引生成在对应的 GPU/CPU 上
-                perm = torch.randperm(current_points, device=point_cloud.device)
-                indices = perm[:num_points]
-                # 应用索引，裁剪点云
-                point_cloud = point_cloud[:, :, indices, :]
-            elif current_points < num_points:
-                # 如果点数少于目标点数，依然报错（或者你可以选择 padding）
-                raise ValueError(f"Input point cloud has {current_points} points, but expected {num_points}")
-
-        else:
-            raise ValueError(f"Expected point_cloud to have 3 or 4 dimensions, got {point_cloud.dim()}")
+        
+        inferred_channels = point_cloud.shape[-1]
+        current_points = point_cloud.shape[2]
+        if current_points > num_points:
+            # 如果点数多于目标点数，进行随机下采样
+            # 生成随机排列的索引，并取前 num_points 个
+            # device=point_cloud.device 确保索引生成在对应的 GPU/CPU 上
+            perm = torch.randperm(current_points, device=point_cloud.device)
+            indices = perm[:num_points]
+            point_cloud = point_cloud[:, :, indices, :]
+        elif current_points < num_points:
+            # 如果点数少于目标点数，报错
+            raise ValueError(f"Input point cloud has {current_points} points, but expected {num_points}")
 
         # 截断到指定的通道数
         if inferred_channels != pc_channels:
@@ -293,18 +282,18 @@ class IDP3Model(nn.Module):
         # Encode pointcloud features and concatenate them all together along with the state vector using mutli-stage pointnet encoder.
         batch["observation.pc_h"] = self.preprocess_pointcloud(
             batch["observation.pc_h"],
-            num_points=self.config.PointCloudEncoderConfig.num_points,
-            pc_channels=self.config.PointCloudEncoderConfig.in_channels,
+            num_points=self.config.pointcloud_encoder_cfg.num_points,
+            pc_channels=self.config.pointcloud_encoder_cfg.in_channels,
         )
         batch["observation.pc_l"] = self.preprocess_pointcloud(
             batch["observation.pc_l"],
-            num_points=self.config.PointCloudEncoderConfig.num_points,
-            pc_channels=self.config.PointCloudEncoderConfig.in_channels,
+            num_points=self.config.pointcloud_encoder_cfg.num_points,
+            pc_channels=self.config.pointcloud_encoder_cfg.in_channels,
         )
         batch["observation.pc_r"] = self.preprocess_pointcloud(
             batch["observation.pc_r"],
-            num_points=self.config.PointCloudEncoderConfig.num_points,
-            pc_channels=self.config.PointCloudEncoderConfig.in_channels,
+            num_points=self.config.pointcloud_encoder_cfg.num_points,
+            pc_channels=self.config.pointcloud_encoder_cfg.in_channels,
         )
 
         batch["observation.state"] = batch["observation.state"].reshape(
@@ -355,18 +344,18 @@ class IDP3Model(nn.Module):
         # Encode point cloud features.
         batch["observation.pc_h"] = self.preprocess_pointcloud(
             batch["observation.pc_h"],
-            num_points=self.config.PointCloudEncoderConfig.num_points,
-            pc_channels=self.config.PointCloudEncoderConfig.in_channels,
+            num_points=self.config.pointcloud_encoder_cfg.num_points,
+            pc_channels=self.config.pointcloud_encoder_cfg.in_channels,
         )
         batch["observation.pc_l"] = self.preprocess_pointcloud(
             batch["observation.pc_l"],
-            num_points=self.config.PointCloudEncoderConfig.num_points,
-            pc_channels=self.config.PointCloudEncoderConfig.in_channels,
+            num_points=self.config.pointcloud_encoder_cfg.num_points,
+            pc_channels=self.config.pointcloud_encoder_cfg.in_channels,
         )
         batch["observation.pc_r"] = self.preprocess_pointcloud(
             batch["observation.pc_r"],
-            num_points=self.config.PointCloudEncoderConfig.num_points,
-            pc_channels=self.config.PointCloudEncoderConfig.in_channels,
+            num_points=self.config.pointcloud_encoder_cfg.num_points,
+            pc_channels=self.config.pointcloud_encoder_cfg.in_channels,
         )
         batch["observation.state"] = batch["observation.state"].reshape(
             -1, *batch["observation.state"].shape[2:]
