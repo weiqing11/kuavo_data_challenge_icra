@@ -1,5 +1,7 @@
 # multimodal_diffusion_wrapper.py
 import math
+from pathlib import Path
+from PIL import Image
 from typing import Optional, Dict, Any
 import einops
 import torch
@@ -8,7 +10,7 @@ from torch import Tensor
 import torchvision
 import torch.nn.functional as F
 
-from transformers import AutoModel, SiglipVisionModel
+from transformers import AutoModel, SiglipVisionModel, SiglipImageProcessor
 from kuavo_train.logger import logger, log_box, Colors
 
 from lerobot.utils.constants import OBS_ENV_STATE, OBS_IMAGES, OBS_STATE
@@ -23,6 +25,7 @@ from lerobot.policies.diffusion.modeling_diffusion import (
 )
 from kuavo_train.wrapper.policy.diffusion_new.transformer_diffusion import TransformerForDiffusion
 from kuavo_train.wrapper.policy.diffusion_new.DFormerv2 import DFormerv2_S, DFormerv2_B, DFormerv2_L
+from kuavo_train.wrapper.policy.diffusion_new.DiT_1D_AdaLN import DiT_S
 
 # diffusers scheduler classes (factory expects these names)
 from diffusers.schedulers.scheduling_ddim import DDIMScheduler
@@ -359,9 +362,14 @@ class SiglipRGBEncoder(nn.Module):
             raise ValueError(f"Unknown mode: {self.mode}")
 
         self.siglip = SiglipVisionModel.from_pretrained(config.siglip_model_name)
+        self.processor = SiglipImageProcessor.from_pretrained(config.siglip_model_name)
         self.use_lora = getattr(config, "use_lora", False)
         self.vision_freeze = getattr(config, "vision_freeze", True)
         
+        self.processor_dump_dir = Path("/home/liangweiqing/data/code/kuavo_data_challenge_icra/tmp/siglip_debug")
+        self.processor_dump_dir.mkdir(parents=True, exist_ok=True)
+        self._dump_counter = 0
+
         if self.use_lora:
             self._apply_lora(config)
             self.vision_freeze = False  # 使用 LoRA 时不冻结
@@ -375,11 +383,31 @@ class SiglipRGBEncoder(nn.Module):
 
         self._init_patches_head(config)
 
+    def _dump_inputs_for_debug(self, imgs: torch.Tensor, max_save: int | None = None):
+        max_save = max_save or getattr(self.config, "siglip_debug_save_n", 4)
+        
+        imgs_cpu = imgs.detach().cpu().float()
+        
+        # 【修改】使用 mean 来判断，或者直接强制乘 255（如果你确信输入总是 [0,1]）
+        # 只要均值很小（比如小于 10），就认为需要缩放。这比 max() 更抗噪。
+        if imgs_cpu.mean() <= 10.0:   
+            imgs_cpu = imgs_cpu * 255.0
+            
+        imgs_to_save = torch.clamp(imgs_cpu, 0, 255).to(torch.uint8)
+
+        for idx in range(min(len(imgs_to_save), max_save)):
+            # 注意：LeRobot 读入通常是 RGB，SigLIP 也需要 RGB
+            # Image.fromarray 默认处理 RGB，不需要 permute 通道顺序（除非原图是 BGR）
+            # 但 PyTorch Tensor 是 (C, H, W)，需要 permute 到 (H, W, C) 给 PIL
+            pil_img = Image.fromarray(imgs_to_save[idx].permute(1, 2, 0).numpy())
+            pil_img.save(self.processor_dump_dir / f"siglip_input_{self._dump_counter:06d}_{idx}.png")
+        self._dump_counter += 1
+
     def _apply_lora(self, config):
         peft_config = LoraConfig(
             r=getattr(config, "lora_rank", 16),
             lora_alpha=getattr(config, "lora_alpha", 32),
-            target_modules=["q_proj", "v_proj"],
+            target_modules=["q_proj", "k_proj", "v_proj", "out_proj", "fc1", "fc2"],
             lora_dropout=getattr(config, "lora_dropout", 0.05),
             bias="none",
         )
@@ -412,19 +440,28 @@ class SiglipRGBEncoder(nn.Module):
         self.proj = nn.Linear(self.hidden_size, self.feature_dim)
         self.norm = nn.LayerNorm(self.feature_dim)
         
-        logger.info(f"✅ SigLip initialized in [Patches] mode. "
-                    f"Grid: {self.grid_h}x{self.grid_w}={self.num_patches} patches. "
-                    f"Proj: {self.hidden_size}->{self.feature_dim}")
+        logger.info("SigLIP Vision Encoder initialized:")
+        logger.info(f"  - Model: {self.config.siglip_model_name}")
+        logger.info(f"  - SigLIP dim: {self.hidden_size}")
+        logger.info(f"  - Output dim: {self.feature_dim}")
+        logger.info(f"  - Image size: {h}x{w}")
+        logger.info(f"  - Num patches: {self.num_patches}")
+        logger.info(f"  - loRA: {'Enabled' if self.use_lora else 'Disabled'}")
+        logger.info(f"  - Frozen: {self.vision_freeze}")
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         requires_grad = self.use_lora or (not self.vision_freeze)
         context = torch.enable_grad() if requires_grad else torch.no_grad()
         
+        # self._dump_inputs_for_debug(x)
+
         with context:
-            outputs = self.siglip(x, interpolate_pos_encoding=True)
+            x = self.processor(images=x, do_resize=False, do_rescale=False, return_tensors="pt")
+            outputs = self.siglip(x['pixel_values'].cuda(), interpolate_pos_encoding=True)
 
         tokens = self.proj(outputs.last_hidden_state)   
-        
+        tokens = self.norm(tokens)
+
         return tokens
 
 class DFomerRGBDBackbone(nn.Module):
@@ -972,6 +1009,14 @@ class CustomDiffusionModelWrapper(DiffusionModel):
                 obs_as_cond=True,
                 n_cond_layers=0,
             )
+        elif config.use_dit:
+            self.unet = DiT_S(
+                action_dim=config.output_features["action"].shape[0],
+                action_seq_len=config.horizon,
+                n_obs_steps=self.config.n_obs_steps,
+                token_dim=self.cond_feat_dim,
+                max_image_tokens=vision_seq_len      
+            )
         else:
             raise ValueError("Either `use_unet` or `use_transformer` must be True in config.")
 
@@ -1078,8 +1123,9 @@ class CustomDiffusionModelWrapper(DiffusionModel):
         # 4. 展平时间步 S
         # 最终形状: [B, S * All_Tokens_Per_Step, D]
         # DiT 会自动处理这个长序列的 Positional Embedding (因为它认为 length = n_obs_steps 参数)
-        global_cond = einops.rearrange(combined, "b s t d -> b (s t) d")
-
+        #global_cond = einops.rearrange(combined, "b s t d -> b (s t) d")
+        global_cond = combined
+        
         return global_cond
 
     # ---------------------------
