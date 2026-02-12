@@ -125,9 +125,8 @@ class ObsBuffer:
         resize_wh = handle.get("params", {}).get("resize_wh", None)
         if resize_wh:
             cv_img = cv2.resize(cv_img, resize_wh)
-        # 缓存头部相机的原始 RGB 图像
-        if "head" in key:
-            self.raw_rgb_frames[key] = cv_img
+        # 缓存原始 RGB 图像
+        self.raw_rgb_frames[key] = cv_img
         data = self.img_preprocess(cv_img)
         self._append_data(key, data, msg.header.stamp.to_sec())
 
@@ -143,9 +142,8 @@ class ObsBuffer:
         resize_wh = handle.get("params", {}).get("resize_wh", None)
         if resize_wh:
             image = cv2.resize(image, resize_wh)
-        # 缓存头部相机的原始深度图像
-        if "depth_h" in key:
-            self.raw_depth_frames[key] = image
+        # 缓存原始深度图像
+        self.raw_depth_frames[key] = image
         image = image[np.newaxis, ...]
         data = self.depth_preprocess(image, depth_range=handle.get("params", {}).get("depth_range", [0, 1500]))
         self._append_data(key, data, msg.header.stamp.to_sec())

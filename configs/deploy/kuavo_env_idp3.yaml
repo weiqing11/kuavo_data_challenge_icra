@@ -92,8 +92,18 @@ inference:
   seed: 42  # Randomisation seeding.
   start_seed: 42  # Initial seed for each episode
   device: "cuda"  # or "cpu"
-  task: "idp3_v2_no_rgb"  # Task name - should match your training task
+  task: "idp3_3v_rgb"  # Task name - should match your training task
   method: "idp3"  # Method name - IDP3 policy
-  timestamp: "run_20260125_184949"  # Training timestamp - Update this to your actual training run timestamp
-  epoch: best  # Which epoch to use from the training weights. I.e. 50, 100, best, etc. Note:Weights will be used from outputs/train/<task>/<method>/<timestamp>/epoch<epoch> to load policy
+  timestamp: "run_20260209_225505"  # Training timestamp - Update this to your actual training run timestamp
+  epoch: 20  # Which epoch to use from the training weights. I.e. 50, 100, best, etc. Note:Weights will be used from outputs/train/<task>/<method>/<timestamp>/epoch<epoch> to load policy
   max_episode_steps: 200  # Max episode steps. Stops after this threshold. Increase for longer tasks.
+
+  # 新增点云配置选项
+  need_point_cloud: true
+  point_cloud_num_points: 4096
+  point_cloud_channels: 6
+  point_cloud_keys:
+    head_cam_h: "depth_h"
+    wrist_cam_l: "depth_l"
+    wrist_cam_r: "depth_r"
+  point_cloud_method: "fps"
