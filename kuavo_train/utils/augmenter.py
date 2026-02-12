@@ -570,7 +570,7 @@ def resize_image(
     image: Tensor, 
     target_size: tuple[int, int], 
     image_type='rgb', 
-    mode='pad'  # 'pad', 'crop' 或 'none'
+    mode='crop'  # 'pad', 'crop' 或 'none'
 ) -> Tensor:
     # 1. 准备参数
     h, w = image.shape[-2:]

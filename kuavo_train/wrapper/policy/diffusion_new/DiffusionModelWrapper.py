@@ -10,7 +10,7 @@ from torch import Tensor
 import torchvision
 import torch.nn.functional as F
 
-from transformers import AutoModel, SiglipVisionModel, SiglipImageProcessor
+from transformers import AutoModel, AutoImageProcessor, SiglipVisionModel, SiglipImageProcessor
 from kuavo_train.logger import logger, log_box, Colors
 
 from lerobot.utils.constants import OBS_ENV_STATE, OBS_IMAGES, OBS_STATE
@@ -50,66 +50,6 @@ def _make_noise_scheduler_factory(name: str, **kwargs: Dict[str, Any]):
     else:
         raise ValueError(f"Unsupported noise scheduler type {name}")
 
-class EnhancedSpatialSoftmax(nn.Module):
-    def __init__(
-        self, 
-        input_shape, 
-        num_kp=64, 
-        initial_temp=1.0, 
-        dropout_prob=0.1,
-        use_normalization=True
-    ):
-        super().__init__()
-        self._in_c, self._in_h, self._in_w = input_shape
-        self._out_c = num_kp
-
-        # 1. 特征提取增强层：增加非线性映射和归一化
-        layers = [nn.Conv2d(self._in_c, num_kp, kernel_size=1)]
-        if use_normalization:
-            # 使用 GroupNorm 而不是 BatchNorm，因为机器人训练通常 Batch 很小
-            layers.append(nn.GroupNorm(num_groups=min(8, num_kp), num_channels=num_kp))
-        
-        # layers.append(nn.ReLU()) # 强制过滤负向信号，只保留正面响应
-        self.feature_extractor = nn.Sequential(*layers)
-
-        # 2. 空间 Dropout：强迫模型不要死磕某一个背景纹理
-        self.dropout = nn.Dropout2d(p=dropout_prob)
-
-        # 3. 可学习的温度系数（按通道独立学习）
-        # 不同的关键点可能需要不同的锐度
-        self.log_temp = nn.Parameter(torch.ones(1, num_kp, 1) * np.log(initial_temp))
-
-        # 4. 坐标网格生成 (保持 [-1, 1])
-        pos_x, pos_y = np.meshgrid(np.linspace(-1.0, 1.0, self._in_w), np.linspace(-1.0, 1.0, self._in_h))
-        pos_grid = torch.from_numpy(np.stack([pos_x, pos_y], axis=-1)).reshape(-1, 2).float()
-        self.register_buffer("pos_grid", pos_grid)
-
-    def forward(self, features: Tensor) -> Tensor:
-        # Step A: 维度映射与激活
-        # [B, in_C, H, W] -> [B, K, H, W]
-        x = self.feature_extractor(features)
-        
-        # Step B: 空间 Dropout
-        # 随机丢弃部分特征块，防止模型产生对背景特定像素的依赖
-        x = self.dropout(x)
-
-        # Step C: 应用温度系数
-        # [B, K, H*W]
-        B, K, H, W = x.shape
-        x = x.view(B, K, H * W)
-        temp = torch.exp(self.log_temp)
-        x = x * temp
-
-        # Step D: 数值稳定的 Softmax
-        # 减去 Max 可以防止 exp(100) 导致的数值溢出
-        x_max = x.max(dim=-1, keepdim=True)[0].detach()
-        attention = F.softmax(x - x_max, dim=-1)
-
-        # Step E: 计算质心坐标
-        # [B, K, H*W] @ [H*W, 2] -> [B, K, 2]
-        expected_xy = torch.matmul(attention, self.pos_grid)
-        
-        return expected_xy
 
 # === Definitions for MLP Projection Module, with Signature :: [..., in_dim] --> [..., out_dim] ===
 class MLPProjector(nn.Module):
@@ -152,6 +92,72 @@ class FeatureEncoder(nn.Module):
             return out  # (B, T, out_dim)
         else:
             raise ValueError("FeatureEncoder expects 2D or 3D tensor.")
+
+
+# [新增] Perceiver Resampler 模块
+class PerceiverResampler(nn.Module):
+    def __init__(
+        self,
+        dim: int,
+        num_queries: int = 64,
+        depth: int = 2,
+        heads: int = 8,
+        dim_head: int = 64,
+        ff_mult: int = 4,
+    ):
+        super().__init__()
+        self.num_queries = num_queries
+        self.latents = nn.Parameter(torch.randn(1, num_queries, dim) * 0.02)
+        
+        self.layers = nn.ModuleList([])
+        for _ in range(depth):
+            self.layers.append(nn.ModuleDict({
+                # Cross Attention: Query=Latents, Key/Value=Input Features
+                'cross_attn': nn.MultiheadAttention(embed_dim=dim, num_heads=heads, batch_first=True),
+                'cross_norm_q': nn.LayerNorm(dim),
+                'cross_norm_kv': nn.LayerNorm(dim),
+                
+                # Self Attention: Query=Latents
+                'self_attn': nn.MultiheadAttention(embed_dim=dim, num_heads=heads, batch_first=True),
+                'self_norm': nn.LayerNorm(dim),
+                
+                # Feed Forward
+                'ff': nn.Sequential(
+                    nn.LayerNorm(dim),
+                    nn.Linear(dim, dim * ff_mult),
+                    nn.GELU(),
+                    nn.Linear(dim * ff_mult, dim)
+                )
+            }))
+        
+        self.norm_out = nn.LayerNorm(dim)
+
+    def forward(self, x: Tensor) -> Tensor:
+        # x shape: [B, N_inputs, D]
+        B = x.shape[0]
+        
+        # 1. Expand latents to batch size: [B, num_queries, D]
+        latents = self.latents.repeat(B, 1, 1)
+        
+        for layer in self.layers:
+            # --- Cross Attention ---
+            # Q 来自 Latents, K,V 来自输入 x
+            q = layer['cross_norm_q'](latents)
+            k = v = layer['cross_norm_kv'](x)
+            
+            # output shape: [B, num_queries, D]
+            cross_out, _ = layer['cross_attn'](query=q, key=k, value=v)
+            latents = latents + cross_out
+            
+            # --- Self Attention ---
+            q_sa = layer['self_norm'](latents)
+            self_out, _ = layer['self_attn'](query=q_sa, key=q_sa, value=q_sa)
+            latents = latents + self_out
+            
+            # --- Feed Forward ---
+            latents = latents + layer['ff'](latents)
+            
+        return self.norm_out(latents)
 
 
 class DinoSiglipBackbone(nn.Module):
@@ -249,161 +255,305 @@ class DinoSiglipBackbone(nn.Module):
 
 
 class DinoSiglipRGBEncoder(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        
-        # 1. 初始化 Backbone
-        self.backbone = DinoSiglipBackbone(config)
-        self.dino_dim = self.backbone.dinov2.config.hidden_size
-        self.siglip_dim = self.backbone.siglip.config.hidden_size
-        
-        # 2. 维度投影
-        self.fusion_dim = getattr(config, "vision_fusion_dim", 256)
-        self.proj_dino = nn.Conv2d(self.dino_dim, self.fusion_dim, kernel_size=1)
-        self.proj_siglip = nn.Conv2d(self.siglip_dim, self.fusion_dim, kernel_size=1)
+    """
+    DINO + SigLIP 双塔视觉编码器 (Dual-Tower Vision Encoder)
+    
+    功能：
+    1. 并行运行 SigLIP (语义强) 和 DINO (几何强) 模型。
+    2. 支持 DINOv2 和 DINOv3 (通过 AutoModel 加载)。
+    3. 分别处理两种模型的不同归一化需求。
+    4. 输出拼接后的 Token 序列，供下游 (如 Perceiver Resampler) 使用。
+    
+    输出形状:
+        [Batch, N_siglip + N_dino, projection_dim]
+    """
 
-        # 3. 双向 Cross-Attention
-        # 路径 A: SigLIP 引导 DINO (语义找几何)
-        self.attn_s2d = nn.MultiheadAttention(
-            embed_dim=self.fusion_dim,
-            num_heads=getattr(config, "vision_attn_heads", 8),
-            batch_first=True
-        )
-        
-        # 路径 B: DINO 引导 SigLIP (几何找语义)
-        self.attn_d2s = nn.MultiheadAttention(
-            embed_dim=self.fusion_dim,
-            num_heads=getattr(config, "vision_attn_heads", 8),
-            batch_first=True
-        )
-
-        # 4. 融合后的处理层 (简单的 LayerNorm 增加稳定性)
-        self.norm = nn.LayerNorm(self.fusion_dim)
-
-        # 5. 自动计算网格并初始化池化层
-        self._setup_spatial_softmax(config)
-
-        # 6. 输出投影
-        self.feature_dim = self.num_kp * 2
-        self.out = nn.Linear(self.feature_dim, self.feature_dim)
-        self.relu = nn.ReLU()
-
-        dino_params = sum(p.numel() for p in self.backbone.dinov2.parameters())
-        siglip_params = sum(p.numel() for p in self.backbone.siglip.parameters())
-        total_params = sum(p.numel() for p in self.parameters())
-        trainable_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
-
-        log_box("RGB Encoder Config", {
-            "DINO Model": self.backbone.dinov2_model_name,
-            "SigLIP Model": self.backbone.siglip_model_name,
-            "DINO Params": f"{dino_params:,}",
-            "SigLIP Params": f"{siglip_params:,}",
-            "Total Encoder Params": f"{total_params:,}",    
-            "Trainable Params": f"{trainable_params:,}", 
-            "Fusion Mode": "Cross-Attention",
-            "Fusion Dim": self.fusion_dim,
-            "Keypoints": self.num_kp,
-            "Feature Dim": self.feature_dim,
-        }, icon="👁️")
-
-    def _setup_spatial_softmax(self, config):
-        # 这里的逻辑与之前一致，用于确定 SpatialSoftmax 的输入形状
-        first_img_shape = next(iter(config.image_features.values())).shape
-        h, w = config.resize_shape if config.resize_shape else first_img_shape[1:]
-        self.grid_h, self.grid_w = h // self.backbone.dino_p, w // self.backbone.dino_p
-        self.num_kp = config.spatial_softmax_num_keypoints
-        self.pool = SpatialSoftmax([self.fusion_dim, self.grid_h, self.grid_w], num_kp=self.num_kp)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # 1. 提取原始特征图 [B, C, H, W]
-        dino_raw, siglip_raw = self.backbone(x)
-        B, _, H, W = dino_raw.shape
-
-        if siglip_raw.shape[-2:] != (H, W):
-            siglip_raw = F.interpolate(
-                siglip_raw, 
-                size=(H, W), 
-                mode='bilinear', 
-                align_corners=False
-            )
-        
-        # 2. 投影并展平为 Token 序列 [B, HW, D]
-        dino_qkv = self.proj_dino(dino_raw).flatten(2).permute(0, 2, 1)
-        siglip_qkv = self.proj_siglip(siglip_raw).flatten(2).permute(0, 2, 1)
-
-        # 3. 执行双向 Cross-Attention
-        # 路径 1: SigLIP(Q) + DINO(K,V) -> 几何增强的语义
-        feat_s2d, _ = self.attn_s2d(query=siglip_qkv, key=dino_qkv, value=dino_qkv)
-        
-        # 路径 2: DINO(Q) + SigLIP(K,V) -> 语义增强的几何
-        feat_d2s, _ = self.attn_d2s(query=dino_qkv, key=siglip_qkv, value=siglip_qkv)
-
-        # 4. 特征融合 (这里采用求和 + LayerNorm，保持维度并实现信息互补)
-        fused_tokens = self.norm(feat_s2d + feat_d2s)
-
-        # 5. 还原为特征图并提取关键点 [B, num_kp, 2]
-        fused_feat = fused_tokens.permute(0, 2, 1).view(B, self.fusion_dim, H, W)
-        kp = self.pool(fused_feat)
-
-        # 6. 展平投影
-        x = torch.flatten(kp, start_dim=1)
-        x = self.relu(self.out(x))
-        
-        return x
-
-
-class SiglipRGBEncoder(nn.Module):
-    """SigLIP patch-token encoder with optional LoRA fine-tuning."""
     def __init__(self, config):
         super().__init__()
         self.config = config
-        self.mode = getattr(config, "vision_encoder_mode", "patches")
-        if self.mode != "patches":
-            raise ValueError(f"Unknown mode: {self.mode}")
+        
+        # =========================================================================
+        # 1. 配置与模型加载 (Configuration & Model Loading)
+        # =========================================================================
+        self.siglip_model_name = config.siglip_model_name
+        # 优先读取 dino_model_name，兼容旧配置 dinov2_model_name
+        self.dino_model_name = getattr(config, "dino_model_name", getattr(config, "dinov2_model_name", None))
+        
+        if self.dino_model_name is None:
+            raise ValueError("❌ Config Error: Please specify 'dino_model_name' in your config.")
 
-        self.siglip = SiglipVisionModel.from_pretrained(config.siglip_model_name)
-        self.processor = SiglipImageProcessor.from_pretrained(config.siglip_model_name)
+        # 判定是否强制使用本地文件 (如果路径包含 '/' 则认为是本地路径，不走 HuggingFace Hub)
+        siglip_is_local = "/" in self.siglip_model_name
+        dino_is_local = "/" in self.dino_model_name
+
+        logger.info(f"🏗️ Loading Vision Encoders...")
+        
+        # 加载 SigLIP
+        self.siglip = SiglipVisionModel.from_pretrained(
+            self.siglip_model_name,
+            local_files_only=siglip_is_local
+        )
+        
+        # 加载 DINO (v2/v3)
+        # 注意: trust_remote_code=True 对 DINOv3 可能是必须的
+        # attn_implementation="sdpa" 使用 Torch 2.0+ 的加速注意力
+        self.dino = AutoModel.from_pretrained(
+            self.dino_model_name,
+            local_files_only=dino_is_local,
+            trust_remote_code=True,
+            attn_implementation="sdpa"
+        )
+        
+        # =========================================================================
+        # 2. 图像处理器 (Image Processors)
+        # =========================================================================
+        # SigLIP 和 DINO 需要不同的归一化参数 (Mean/Std)，必须分开处理
+        self.siglip_processor = SiglipImageProcessor.from_pretrained(
+            self.siglip_model_name,
+            local_files_only=siglip_is_local
+        )
+        self.dino_processor = AutoImageProcessor.from_pretrained(
+            self.dino_model_name,
+            local_files_only=dino_is_local,
+            trust_remote_code=True
+        )
+
+        # =========================================================================
+        # 3. LoRA 微调与冻结策略 (LoRA & Freeze Strategy)
+        # =========================================================================
         self.use_lora = getattr(config, "use_lora", False)
         self.vision_freeze = getattr(config, "vision_freeze", True)
-        
-        self.processor_dump_dir = Path("/home/liangweiqing/data/code/kuavo_data_challenge_icra/tmp/siglip_debug")
-        self.processor_dump_dir.mkdir(parents=True, exist_ok=True)
-        self._dump_counter = 0
 
         if self.use_lora:
-            self._apply_lora(config)
-            self.vision_freeze = False  # 使用 LoRA 时不冻结
+            self._setup_lora(config)
+            self.vision_freeze = False # 开启 LoRA 时强制解冻
+        elif self.vision_freeze:
+            # 冻结所有参数
+            self.siglip.requires_grad_(False)
+            self.dino.requires_grad_(False)
+            self.siglip.eval()
+            self.dino.eval()
+        else:
+            # 全量微调
+            self.siglip.train()
+            self.dino.train()
+
+        # =========================================================================
+        # 4. Token 数量计算 (关键修改)
+        # =========================================================================
+        # 获取输入图像尺寸 (H, W)
+        if config.resize_shape:
+            h, w = config.resize_shape
+        else:
+            # 如果没有 resize，尝试从 image_features 的 tensor shape 获取
+            first_shape = next(iter(config.image_features.values())).shape
+            h, w = first_shape[1:]
+
+        # --- 计算 SigLIP Token 数 ---
+        # SigLIP 通常只有 Grid Patches，没有 CLS
+        self.siglip_p = self.siglip.config.patch_size
+        self.num_siglip_tokens = (h // self.siglip_p) * (w // self.siglip_p)
+
+        # --- 计算 DINO Token 数 ---
+        # DINO 通常有 1个 CLS + Grid Patches + (可选) Registers
+        self.dino_p = self.dino.config.patch_size
+        grid_dino = (h // self.dino_p) * (w // self.dino_p)
+        
+        # 检查是否有寄存器 token (DINOv2-registers 模型)
+        self.num_registers = getattr(self.dino.config, "num_register_tokens", 0)
+        self.num_dino_tokens = grid_dino + 1 # +1 是 CLS Token
+
+        # 总 Token 数
+        self.num_patches = self.num_siglip_tokens + self.num_dino_tokens
+
+        # =========================================================================
+        # 5. 特征投影层 (Feature Projection)
+        # =========================================================================
+        # 将两个模型的不同输出维度统一映射到 transformer_n_emb (例如 384)
+        target_dim = getattr(config, "transformer_n_emb", 384) 
+        self.siglip_dim = self.siglip.config.hidden_size
+        self.dino_dim = self.dino.config.hidden_size
+
+        self.proj_siglip = nn.Linear(self.siglip_dim, target_dim)
+        self.proj_dino = nn.Linear(self.dino_dim, target_dim)
+        
+        self.norm_siglip = nn.LayerNorm(target_dim)
+        self.norm_dino = nn.LayerNorm(target_dim)
+        
+        self.feature_dim = target_dim
+
+        self._log_init_info(target_dim, h, w)
+
+    def _setup_lora(self, config):
+        """配置并应用 LoRA"""
+        # SigLIP LoRA 配置
+        peft_config_siglip = LoraConfig(
+            r=getattr(config, "lora_rank", 16),
+            lora_alpha=getattr(config, "lora_alpha", 32),
+            target_modules=["q_proj", "k_proj", "v_proj", "out_proj", "fc1", "fc2"],
+            lora_dropout=getattr(config, "lora_dropout", 0.05),
+            bias="none",
+        )
+        self.siglip = get_peft_model(self.siglip, peft_config_siglip)
+        
+        # DINO LoRA 配置 (适用于标准 ViT 结构)
+        peft_config_dino = LoraConfig(
+            r=getattr(config, "lora_rank", 16),
+            lora_alpha=getattr(config, "lora_alpha", 32),
+            target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "up_proj", "down_proj"], 
+            lora_dropout=getattr(config, "lora_dropout", 0.05),
+            bias="none",
+        )
+        self.dino = get_peft_model(self.dino, peft_config_dino)
+
+    def _log_init_info(self, target_dim, h, w):
+        """打印初始化日志"""
+        # 确定当前训练状态
+        if self.use_lora:
+            status = "🔥 LoRA Fine-Tuning"
+        elif self.vision_freeze:
+            status = "❄️ Frozen (Inference Only)"
+        else:
+            status = "🚀 Full Fine-Tuning"
+
+        # 构造打印信息字典
+        encoder_info = {
+            "Input Resolution": f"{h} x {w}",
+            "SigLIP Model": f"{self.siglip_model_name} (P={self.siglip_p})",
+            "SigLIP Tokens": f"{self.num_siglip_tokens}",
+            "DINO Model": f"{self.dino_model_name} (P={self.dino_p})",
+            "DINO Tokens": f"{self.num_dino_tokens} (Inc. 1 CLS, Excl. {self.num_registers} Regs)",
+            "Total Seq Length": f"{self.num_patches} Tokens",
+            "Projection Dim": f"{target_dim} (Transformer Input)",
+            "Training Status": status,
+        }
+
+        # 调用你自定义的 log_box 函数
+        log_box("Dual Vision Encoder Configuration", encoder_info, icon="✨")
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        前向传播
+        Args:
+            x: 输入图像张量 [Batch, 3, Height, Width]
+        Returns:
+            combined_tokens: [Batch, Total_Patches, target_dim]
+        """
+        # 根据是否微调决定是否开启梯度计算
+        requires_grad = self.use_lora or (not self.vision_freeze)
+        context = torch.enable_grad() if requires_grad else torch.no_grad()
+        
+        with context:
+            # 1. SigLIP Forward
+            # SigLIP 通常需要 range [-1, 1] 或特定的 mean/std，processor 会自动处理
+            siglip_in = self.siglip_processor(images=x, do_resize=False, do_rescale=False, return_tensors="pt")
+            # interpolate_pos_encoding=True 允许输入分辨率与预训练不同 (例如 3:4 比例)
+            siglip_out = self.siglip(siglip_in['pixel_values'].to(x.device), interpolate_pos_encoding=True)
+            siglip_feat = siglip_out.last_hidden_state # Shape: [B, N_sig, D_sig]
+
+            # 2. DINO Forward
+            # DINO 通常需要 ImageNet mean/std
+            dino_in = self.dino_processor(images=x, do_resize=False, do_rescale=False, return_tensors="pt")
+            dino_out = self.dino(dino_in['pixel_values'].to(x.device), interpolate_pos_encoding=True)
+            raw_dino_feat = dino_out.last_hidden_state # Shape: [B, N_dino, D_dino]
+
+            # 处理 DINO 的 Token
+            # 结构: [CLS, Reg_1, ..., Reg_n, Patch_1, ...]
+            # 目标: 保留 CLS 和 Patches，丢弃 Registers
+            
+            # A. 提取 CLS (Index 0)
+            cls_token = raw_dino_feat[:, 0:1, :] 
+            
+            # B. 提取 Patches (跳过 CLS 和 Registers)
+            # start_index = 1 + num_registers
+            patch_start_idx = 1 + self.num_registers
+            patch_tokens = raw_dino_feat[:, patch_start_idx:, :]
+            
+            # C. 拼接回: [CLS, Patches]
+            dino_feat = torch.cat([cls_token, patch_tokens], dim=1)
+
+        # 3. 投影与归一化 (Project & Normalize)
+        # 将不同维度的特征映射到同一维度 (如 384)
+        siglip_tokens = self.norm_siglip(self.proj_siglip(siglip_feat))
+        dino_tokens = self.norm_dino(self.proj_dino(dino_feat))
+        
+        # 4. 拼接 (Concatenation)
+        # 在序列维度拼接: [B, N_sig + N_dino, D]
+        # 下游的 Perceiver Resampler 会负责处理这个变长的序列
+        combined_tokens = torch.cat([siglip_tokens, dino_tokens], dim=1)
+
+        return combined_tokens
+
+class SiglipRGBEncoder(nn.Module):
+    """
+    SigLIP 视觉编码器 (SigLIP Vision Encoder)
+    
+    功能：
+    1. 使用 Google SigLIP 模型提取图像特征。
+    2. 输出 Patch Token 序列，而非单一的 CLS Token。
+    3. 支持 LoRA 微调或全量冻结。
+    4. 包含投影层，将特征维度映射到 Transformer 所需维度。
+    
+    输出形状:
+        [Batch, Num_Patches, projection_dim]
+    """
+    
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+        
+        # 1. 模式检查
+        self.mode = getattr(config, "vision_encoder_mode", "patches")
+        if self.mode != "patches":
+            raise ValueError(f"❌ Unknown mode: {self.mode}. SiglipRGBEncoder only supports 'patches' mode.")
+
+        # =========================================================================
+        # 2. 模型与处理器加载 (Model & Processor Loading)
+        # =========================================================================
+        self.siglip_model_name = config.siglip_model_name
+        
+        # 判定是否强制使用本地文件 (路径包含 '/' 视为本地路径)
+        is_local = "/" in self.siglip_model_name
+        
+        logger.info(f"🏗️ Loading SigLIP Model: {self.siglip_model_name}")
+        
+        self.siglip = SiglipVisionModel.from_pretrained(
+            self.siglip_model_name,
+            local_files_only=is_local
+        )
+        
+        # 加载对应的图像处理器 (负责归一化 Mean/Std)
+        self.processor = SiglipImageProcessor.from_pretrained(
+            self.siglip_model_name,
+            local_files_only=is_local
+        )
+
+        # =========================================================================
+        # 3. LoRA 与 冻结策略 (LoRA & Freeze Strategy)
+        # =========================================================================
+        self.use_lora = getattr(config, "use_lora", False)
+        self.vision_freeze = getattr(config, "vision_freeze", True)
+
+        if self.use_lora:
+            self._setup_lora(config)
+            self.vision_freeze = False  # 使用 LoRA 时强制解冻
         elif self.vision_freeze:
             self._freeze_backbone()
         else:
-            self.siglip.train()
+            self.siglip.train()  # 全量微调
 
+        # 获取模型原始维度信息
         self.hidden_size = self.siglip.config.hidden_size
         self.patch_size = self.siglip.config.patch_size
 
+        # =========================================================================
+        # 4. 初始化投影头 (Projection Head)
+        # =========================================================================
         self._init_patches_head(config)
+        self._log_init_info()
 
-    def _dump_inputs_for_debug(self, imgs: torch.Tensor, max_save: int | None = None):
-        max_save = max_save or getattr(self.config, "siglip_debug_save_n", 4)
-        
-        imgs_cpu = imgs.detach().cpu().float()
-        
-        # 【修改】使用 mean 来判断，或者直接强制乘 255（如果你确信输入总是 [0,1]）
-        # 只要均值很小（比如小于 10），就认为需要缩放。这比 max() 更抗噪。
-        if imgs_cpu.mean() <= 10.0:   
-            imgs_cpu = imgs_cpu * 255.0
-            
-        imgs_to_save = torch.clamp(imgs_cpu, 0, 255).to(torch.uint8)
-
-        for idx in range(min(len(imgs_to_save), max_save)):
-            # 注意：LeRobot 读入通常是 RGB，SigLIP 也需要 RGB
-            # Image.fromarray 默认处理 RGB，不需要 permute 通道顺序（除非原图是 BGR）
-            # 但 PyTorch Tensor 是 (C, H, W)，需要 permute 到 (H, W, C) 给 PIL
-            pil_img = Image.fromarray(imgs_to_save[idx].permute(1, 2, 0).numpy())
-            pil_img.save(self.processor_dump_dir / f"siglip_input_{self._dump_counter:06d}_{idx}.png")
-        self._dump_counter += 1
-
-    def _apply_lora(self, config):
+    def _setup_lora(self, config):
+        """配置并应用 LoRA"""
         peft_config = LoraConfig(
             r=getattr(config, "lora_rank", 16),
             lora_alpha=getattr(config, "lora_alpha", 32),
@@ -412,20 +562,22 @@ class SiglipRGBEncoder(nn.Module):
             bias="none",
         )
         self.siglip = get_peft_model(self.siglip, peft_config)
-        logger.info("🔧 SigLIP LoRA enabled (r=%d, alpha=%d).", peft_config.r, peft_config.lora_alpha)
 
     def _freeze_backbone(self):
+        """冻结骨干网络"""
         self.siglip.requires_grad_(False)
         self.siglip.eval()
     
     def _init_patches_head(self, config):
         """
-        初始化 Patch Token 输出模式
-        输出形状: [B, Num_Patches, Projection_Dim]
+        初始化投影层
+        将 SigLip 的特征维度 (如 768/1152) 映射到 DiT/Transformer 的维度 (如 384)
         """
+        # 计算网格大小 (仅用于日志打印，实际 forward 支持动态分辨率)
         if config.resize_shape:
             h, w = config.resize_shape
         else:
+            # 尝试从 image_features 配置中推断形状
             first_shape = next(iter(config.image_features.values())).shape
             h, w = first_shape[1:]
             
@@ -433,32 +585,63 @@ class SiglipRGBEncoder(nn.Module):
         self.grid_w = w // self.patch_size
         self.num_patches = self.grid_h * self.grid_w
         
-        # 2. 投影层：将 SigLip 的巨大维度 (768/1024) 降维到 Transformer 的维度 (如 384/512)
-        # 从 config 获取目标维度，默认使用 transformer_n_emb
+        # 目标投影维度
         target_dim = getattr(config, "transformer_n_emb", 384) 
-        self.feature_dim = target_dim # 输出给 DiT 的特征维度
+        self.feature_dim = target_dim 
+        
+        # 投影层结构：Linear -> LayerNorm
         self.proj = nn.Linear(self.hidden_size, self.feature_dim)
         self.norm = nn.LayerNorm(self.feature_dim)
-        
-        logger.info("SigLIP Vision Encoder initialized:")
-        logger.info(f"  - Model: {self.config.siglip_model_name}")
-        logger.info(f"  - SigLIP dim: {self.hidden_size}")
-        logger.info(f"  - Output dim: {self.feature_dim}")
-        logger.info(f"  - Image size: {h}x{w}")
-        logger.info(f"  - Num patches: {self.num_patches}")
-        logger.info(f"  - loRA: {'Enabled' if self.use_lora else 'Disabled'}")
-        logger.info(f"  - Frozen: {self.vision_freeze}")
+
+    def _log_init_info(self):
+        """以表格/方框形式打印初始化日志"""  
+        # 确定训练状态
+        if self.use_lora:
+            status = "🔥 LoRA Tuned"
+        elif self.vision_freeze:
+            status = "❄️ Frozen"
+        else:
+            status = "🚀 Full Finetune"
+
+        # 构造打印信息字典
+        encoder_info = {
+            "Model Name": self.siglip_model_name,
+            "Input Dim (D)": f"{self.hidden_size}",
+            "Output Dim (D')": f"{self.feature_dim}",
+            "Patch Size (P)": f"{self.patch_size}",
+            "Estimated Tokens": f"{self.num_patches}",
+            "Training Status": status,
+            "Dynamic Scaling": "✅ interpolate_pos_encoding=True",
+        }
+
+        # 调用全局 log_box 函数
+        log_box("SigLIP Vision Encoder Configuration", encoder_info, icon="✨")
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        前向传播
+        Args:
+            x: 输入图像 [Batch, 3, Height, Width]
+        Returns:
+            tokens: [Batch, Num_Patches, feature_dim]
+        """
+        # 根据配置决定是否计算梯度
         requires_grad = self.use_lora or (not self.vision_freeze)
         context = torch.enable_grad() if requires_grad else torch.no_grad()
         
-        # self._dump_inputs_for_debug(x)
-
         with context:
-            x = self.processor(images=x, do_resize=False, do_rescale=False, return_tensors="pt")
-            outputs = self.siglip(x['pixel_values'].cuda(), interpolate_pos_encoding=True)
+            # 1. 预处理 (Normalization)
+            x_processed = self.processor(images=x, do_resize=False, do_rescale=False, return_tensors="pt")
+            
+            # 2. Backbone Forward
+            # interpolate_pos_encoding=True 允许处理非标准分辨率 (如 3:4 比例)
+            outputs = self.siglip(
+                x_processed['pixel_values'].to(x.device), 
+                interpolate_pos_encoding=True
+            )
 
+        # 3. 投影与归一化
+        # outputs.last_hidden_state shape: [B, N_patches, hidden_size]
         tokens = self.proj(outputs.last_hidden_state)   
         tokens = self.norm(tokens)
 
@@ -798,7 +981,7 @@ class DiffusionRgbEncoder(nn.Module):
         self.config = config
         if "resnet" in config.vision_backbone:
             self.model = ResnetRgbEncoder(config)
-        elif "dinov2" in config.vision_backbone and "siglip" in config.vision_backbone:
+        elif "dino" in config.vision_backbone and "siglip" in config.vision_backbone:
             self.model = DinoSiglipRGBEncoder(config)
         elif "siglip_only" in config.vision_backbone:
             self.model = SiglipRGBEncoder(config)
@@ -894,105 +1077,105 @@ class StateGuidedFusionBlock(nn.Module):
 # Main wrapper: integrate encoders, fusion, and diffusion model
 # ---------------------------
 class CustomDiffusionModelWrapper(DiffusionModel):
+    """
+    自定义扩散策略模型包装器 (Custom Diffusion Policy Model Wrapper)
+    
+    功能:
+    1. 集成多种视觉 Backbone (ResNet, SigLIP, DINO, DFormer 等)。
+    2. 支持 Perceiver Resampler 进行 Token 压缩。
+    3. 支持 DiT (Diffusion Transformer) 和 UNet 作为去噪网络。
+    4. 处理多模态输入 (RGB, Depth, Robot State) 的编码与融合。
+    """
+
     def __init__(self, config: CustomDiffusionConfigWrapper):
-        # ensure parent init runs with safe backbone
+        # =========================================================================
+        # 1. 父类初始化 Hack (Parent Init Hack)
+        # =========================================================================
+        # LeRobot 父类检查比较严格，临时替换配置以绕过检查
         orig_vis = config.vision_backbone
         config.vision_backbone = "resnet18"
         orig_noise_scheduler = config.noise_scheduler_type
         config.noise_scheduler_type = "DDPM"
+        
         super().__init__(config)
+        
+        # 恢复原始配置
         config.vision_backbone = orig_vis
         config.noise_scheduler_type = orig_noise_scheduler
-
         self.config = config
+
+        # 基础参数
         global_cond_dim = 0
         vision_seq_len = 0
         self.cond_feat_dim = getattr(self.config, "transformer_n_emb", 384)
-        
-        # ---- state encoder in WRAPPER (only place for discrete or mlp logic) ----
+
+        # =========================================================================
+        # 2. 机器人状态编码器 (Robot State Encoder)
+        # =========================================================================
         self.state_encoder = None
-        state_seq_len = 0
+        
         if getattr(self.config, "robot_state_feature", None) is not None:
             state_dim = self.config.robot_state_feature.shape[0]
             if getattr(self.config, "use_state_encoder", False):
-                out_dim = self.cond_feat_dim
-                self.state_encoder = FeatureEncoder(state_dim, out_dim)
-                state_seq_len += 1
+                # 将低维状态映射到 transformer_n_emb 维度
+                self.state_encoder = FeatureEncoder(state_dim, self.cond_feat_dim)
             else:
-                logger.warning("Robot state feature provided but `use_state_encoder` is False. Using raw state as conditioning.")
+                logger.warning("⚠️ Robot state provided but `use_state_encoder` is False.")
 
-        # ---- RGB encoders ----
+        # =========================================================================
+        # 3. 视觉编码器 (RGB Encoders)
+        # =========================================================================
         if getattr(self.config, "image_features", None):
             num_images = len(self.config.image_features)
+            
+            # 情况 A: 每个摄像头使用独立的编码器 (不共享权重)
             if getattr(self.config, "use_separate_rgb_encoder_per_camera", False):
                 encs = [DiffusionRgbEncoder(config) for _ in range(num_images)]
                 self.rgb_encoder = nn.ModuleList(encs)
                 one_enc = encs[0].model
+            # 情况 B: 所有摄像头共享同一个编码器 (共享权重)
             else:
                 self.rgb_encoder = DiffusionRgbEncoder(config)
                 one_enc = self.rgb_encoder.model
             
+            # 计算原始 Patch 数量
             patches_per_img = one_enc.num_patches
             vision_seq_len = num_images * patches_per_img
 
-        # # ---- Depth encoders (optional) ----
-        # self.depth_feat_dim = 0     
-        # # 1. 检查是否开启 Depth 模块
-        # if getattr(self.config, "use_depth", False) and getattr(self.config, "depth_features", None):
-        #     self.depth_encoder_type = getattr(self.config, "depth_encoder_type", "DEPTH") # 默认为纯深度
+        # =========================================================================
+        # 4. Perceiver Resampler (Token Compression)
+        # =========================================================================
+        self.use_perceiver = getattr(self.config, "use_perceiver", False)
+        if self.use_perceiver:
+            perceiver_queries = getattr(self.config, "perceiver_num_queries", 64)
+            perceiver_depth = getattr(self.config, "perceiver_depth", 2)
             
-        #     # 2. 根据配置决定实例化哪个类
-        #     if self.depth_encoder_type == "DEPTH":
-        #         # 对应纯深度编码器 (如 ResNet18)
-        #         EncoderClass = DiffusionDepthEncoder 
-        #     elif self.depth_encoder_type == "RGBD":
-        #         # 对应 RGBD 融合编码器 (如 DFormer)
-        #         EncoderClass = DiffusionRGBDEncoder
-        #     else:
-        #         raise ValueError(f"Unknown depth_encoder_type: {self.depth_encoder_type}")
-
-        #     num_depth = len(self.config.depth_features)
-
-        #     # 3. 实例化编码器 (支持 per_camera 独立权重或共享权重)
-        #     if getattr(self.config, "use_separate_depth_encoder_per_camera", False):
-        #         encs = [EncoderClass(config) for _ in range(num_depth)]
-        #         self.depth_encoder = nn.ModuleList(encs)
-        #         feat_dim = encs[0].feature_dim
-        #     else:
-        #         self.depth_encoder = EncoderClass(config)
-        #         feat_dim = self.depth_encoder.feature_dim
+            self.perceiver = PerceiverResampler(
+                dim=self.cond_feat_dim,          # 必须匹配 DiT/Encoder 的 transformer_n_emb
+                num_queries=perceiver_queries,
+                depth=perceiver_depth,
+                heads=getattr(self.config, "transformer_n_head", 8)
+            )
             
-        #     # 4. 更新全局维度和 Attention 层
-        #     self.depth_feat_dim = feat_dim * num_depth
-        #     global_cond_dim += self.depth_feat_dim
-            
-        #     # 初始化 Attention
-        #     self.depth_attn_layer = nn.MultiheadAttention(
-        #         embed_dim=feat_dim, 
-        #         num_heads=getattr(self.config, "depth_attn_heads", 8), 
-        #         batch_first=True
-        #     )
+            # [关键] 更新序列长度：经过 Resampler 后，Token 数固定为 Queries 数
+            vision_seq_len = perceiver_queries
+        else:
+            self.perceiver = None
 
-        #     # 初始化多模态融合层
-        #     self.multimodalfuse = nn.ModuleDict({
-        #         "rgb_q": nn.MultiheadAttention(embed_dim=feat_dim, num_heads=getattr(self.config, "multimodal_heads", 8), batch_first=True),
-        #         "depth_q": nn.MultiheadAttention(embed_dim=feat_dim, num_heads=getattr(self.config, "multimodal_heads", 8), batch_first=True),
-        #     })
-
-        # ---- 计算 DiT 需要的总 Context 长度 ----
-        # 比如：2步历史 * (196个视觉Token + 1个状态Token) = 394 个 Token
-        tokens_per_step = vision_seq_len + state_seq_len
+        # =========================================================================
+        # 5. 上下文长度计算 (Context Length Calculation)
+        # =========================================================================
+        # Total Tokens = Vision Tokens * History Steps
+        tokens_per_step = vision_seq_len
         total_cond_len = self.config.n_obs_steps * tokens_per_step
 
-        logger.info(f"🚀 DiT Context Setup")
-        logger.info(f"   Per Step: {vision_seq_len} Vision Tokens + {state_seq_len} State Tokens")
-        logger.info(f"   Total Context Length: {total_cond_len} (over {self.config.n_obs_steps} steps)")
-        logger.info(f"   Embedding Dim: {self.cond_feat_dim}")
-
-        # ---- core diffusion model ----
+        # =========================================================================
+        # 6. 扩散模型核心 (Core Diffusion Model: UNet or DiT)
+        # =========================================================================
         if config.use_unet:
             self.unet = DiffusionConditionalUnet1d(config, global_cond_dim=global_cond_dim * config.n_obs_steps)
         elif config.use_transformer:
+            # 标准 Transformer 实现
             self.unet = TransformerForDiffusion(
                 input_dim=config.output_features["action"].shape[0],
                 output_dim=config.output_features["action"].shape[0],
@@ -1010,6 +1193,7 @@ class CustomDiffusionModelWrapper(DiffusionModel):
                 n_cond_layers=0,
             )
         elif config.use_dit:
+            # DiT (Diffusion Transformer) 实现
             self.unet = DiT_S(
                 action_dim=config.output_features["action"].shape[0],
                 action_seq_len=config.horizon,
@@ -1018,9 +1202,11 @@ class CustomDiffusionModelWrapper(DiffusionModel):
                 max_image_tokens=vision_seq_len      
             )
         else:
-            raise ValueError("Either `use_unet` or `use_transformer` must be True in config.")
+            raise ValueError("❌ Config Error: Either `use_unet`, `use_transformer` or `use_dit` must be True.")
 
-        # ---- scheduler ----
+        # =========================================================================
+        # 7. 噪声调度器 (Noise Scheduler)
+        # =========================================================================
         self.noise_scheduler = _make_noise_scheduler_factory(
             config.noise_scheduler_type,
             num_train_timesteps=config.num_train_timesteps,
@@ -1031,133 +1217,150 @@ class CustomDiffusionModelWrapper(DiffusionModel):
             clip_sample_range=config.clip_sample_range,
             prediction_type=config.prediction_type,
         )
-        # self.noise_scheduler = _make_noise_scheduler_factory(
-        #     config.noise_scheduler_type,
-        #     config.scheduler_params
-        # )
         self.num_inference_steps = config.num_inference_steps or self.noise_scheduler.config.num_train_timesteps
+
+        self._log_model_architecture(vision_seq_len, total_cond_len)
+
+    def _log_model_architecture(self, vision_seq_len, total_cond_len):
+        """以表格形式打印模型架构信息"""
+            
+        # 确定去噪网络类型
+        if self.config.use_dit:
+            denoiser = "Transformer (DiT)"
+        elif self.config.use_transformer:
+            denoiser = "Standard Transformer"
+        else:
+            denoiser = "Conditional UNet-1D"
+
+        # 构造配置字典
+        arch_info = {
+            "Denoiser Type": denoiser,
+            "Condition Dim": self.cond_feat_dim,
+            "Obs Steps (S)": self.config.n_obs_steps,
+            "Tokens Per Step": f"{vision_seq_len} (Vision)",
+            "Total Cond Len": f"{total_cond_len} Tokens",
+            "Perceiver Resampler": f"✅ {self.config.perceiver_num_queries} queries" if self.use_perceiver else "❌ Disabled",
+            "Action Horizon": f"{self.config.horizon} steps",
+            "Noise Scheduler": f"{self.config.noise_scheduler_type} ({self.num_inference_steps} steps)",
+        }
+
+        # 调用 log_box (确保环境中已定义该函数)
+        log_box("Diffusion Policy Architecture", arch_info, icon="🤖")
 
     def _prepare_global_conditioning(self, batch: Dict[str, Tensor]) -> Tensor:
         """
-        Encode & fuse modalities into (B, S, cond_dim).
-        Behavior:
-          - if both rgb & depth: compute rgb_q & dep_q tokens (cross-attn outputs), flatten for cond features,
-            AND create concat tokens (rgb_q_cat = cat(rgb_q, dep_q)) as tokens for state-guided fusion.
-          - if only rgb: use rgb tokens.
-          - state encoding is performed here (wrapper); state_for_fusion will be encoded/flattened and passed to fusion block.
+        准备全局条件特征 (Prepare Global Conditioning)
+        
+        流程:
+        1. 提取 RGB 特征 (可能包含多个摄像头)。
+        2. (可选) 通过 Perceiver Resampler 压缩视觉 Token。
+        3. 提取并编码 Robot State。
+        4. 拼接所有 Token，形成 DiT 的 Condition 输入。
+        
+        Returns:
+            global_cond: [B, S * (N_vis + N_state), D]
         """
         B = batch[OBS_STATE].shape[0]
         S = batch[OBS_STATE].shape[1]  # n_obs_steps
         tokens_list = []
 
-        # ---------- RGB ----------
+        # ---------------------------------------------------------------------
+        # 1. RGB Features Processing
+        # ---------------------------------------------------------------------
         if getattr(self.config, "image_features", None):
+            
+            # A. 提取特征
             if getattr(self.config, "use_separate_rgb_encoder_per_camera", False):
+                # 独立编码器：输入 [N_cam, B*S, C, H, W] -> 输出 list of [B*S, N_patches, D]
                 imgs = einops.rearrange(batch[OBS_IMAGES], "b s n ... -> n (b s) ...")
                 enc_outs = [enc(im) for enc, im in zip(self.rgb_encoder, imgs)]
-                vis_feats = torch.cat(enc_outs)  # (n * B*s, feat)
+                # 拼接所有摄像头的 Patch -> [B*S, N_cam * N_patches, D]
+                vis_tokens = torch.cat(enc_outs, dim=1)
             else:
+                # 共享编码器：输入 [B*S*N_cam, C, H, W] -> 输出 [B*S*N_cam, N_patches, D]
                 imgs = einops.rearrange(batch[OBS_IMAGES], "b s n ... -> (b s n) ...")
-                vis_feats = self.rgb_encoder(imgs)  # [B*S*N_cam, N_Patches, Feat_Dim] (Patches)
-            
-            # 目标: [B, S, (N_cam * N_Patches), D]
-            vis_tokens = einops.rearrange(vis_feats, "(b s n) p d -> b s (n p) d", b=B, s=S)
+                vis_feats = self.rgb_encoder(imgs)
+                # 重排并拼接 -> [B*S, N_cam * N_patches, D]
+                vis_tokens = einops.rearrange(vis_feats, "(b s n) p d -> (b s) (n p) d", b=B, s=S)
+
+            # B. Perceiver 压缩 (关键步骤)
+            if self.use_perceiver:
+                # Input:  [B*S, Total_Raw_Tokens, D]
+                # Output: [B*S, Num_Queries, D] (例如 64 个)
+                vis_tokens = self.perceiver(vis_tokens)
+                
+            # C. 恢复时间维度
+            # [B*S, N_tokens, D] -> [B, S, N_tokens, D]
+            vis_tokens = einops.rearrange(vis_tokens, "(b s) t d -> b s t d", b=B, s=S)
             tokens_list.append(vis_tokens)
-        
-        # # ---------- Depth / RGBD (Modified) ----------
-        # depth_features = None
-        # # 1. 检查是否开启 Depth，且数据中存在 Depth
-        # if getattr(self.config, "use_depth", False) and getattr(self.config, "depth_features", None) and (OBS_DEPTH in batch):
-        #     # 2. 判断当前模式: 'rgbd' (DFormer) 还是 'depth' (ResNet)
-        #     # 默认为 'depth' 以兼容旧 Config
-        #     encoder_mode = getattr(self, "depth_encoder_type", "DEPTH") 
 
-        #     if getattr(self.config, "use_separate_depth_encoder_per_camera", False):
-        #         # === Case A: 每个摄像头独立 Encoder ===
-        #         # 准备 Depth 数据: [B, S, N, ...] -> [N, B*S, ...]
-        #         depths_by_cam = einops.rearrange(batch[OBS_DEPTH], "b s n ... -> n (b s) ...")
-                
-        #         if encoder_mode == "RGBD":
-        #             # RGBD 模式：需要同时准备 RGB 数据，形状必须完全对齐
-        #             imgs_by_cam = einops.rearrange(batch[OBS_IMAGES], "b s n ... -> n (b s) ...")
-        #             # 传入 (rgb, depth)
-        #             enc_outs = [enc(im, d) for enc, im, d in zip(self.depth_encoder, imgs_by_cam, depths_by_cam)]
-        #         else:
-        #             # 纯 Depth 模式：只传 depth
-        #             enc_outs = [enc(d) for enc, d in zip(self.depth_encoder, depths_by_cam)]
-                
-        #         dep_cat = torch.cat(enc_outs)
-        #         depth_features = einops.rearrange(dep_cat, "(n b s) f -> (b s) n f", b=B, s=S)
-            
-        #     else:
-        #         # === Case B: 共享 Encoder ===
-        #         # 准备 Depth 数据: [B, S, N, ...] -> [B*S*N, ...]
-        #         depths_flat = einops.rearrange(batch[OBS_DEPTH], "b s n ... -> (b s n) ...")
-                
-        #         if encoder_mode == "RGBD":
-        #             # RGBD 模式：获取 RGB 数据
-        #             imgs_flat = einops.rearrange(batch[OBS_IMAGES], "b s n ... -> (b s n) ...")
-        #             # 传入 (rgb, depth)
-        #             out = self.depth_encoder(imgs_flat, depths_flat)
-        #         else:
-        #             # 纯 Depth 模式
-        #             out = self.depth_encoder(depths_flat)
-                
-        #         depth_features = einops.rearrange(out, "(b s n) f -> (b s) n f", b=B, s=S)
-
-        #     # 3. Apply Self-Attention
-        #     depth_features = self.depth_attn_layer(depth_features, depth_features, depth_features)[0]  # (b*s, n, feat)
-
-        # ---------- State encoding (WRAPPER does this) ----------
-        state_tensor = None
+        # ---------------------------------------------------------------------
+        # 2. Robot State Processing
+        # ---------------------------------------------------------------------
         if getattr(self.config, "robot_state_feature", None) is not None:
-            state_tensor = batch[OBS_STATE]  # (B, S, state_dim)
+            state_tensor = batch[OBS_STATE]  # [B, S, state_dim]
+            
             if self.state_encoder is not None:
-                # encoder may accept (B, S, D) and returns (B, S, out_dim)
-                state_emb = self.state_encoder(state_tensor)  # (B, S, final_state_dim)
-                state_tokens = state_emb.unsqueeze(2)  # (B, S, 1, final_state_dim)
+                # [B, S, state_dim] -> [B, S, transformer_n_emb]
+                state_emb = self.state_encoder(state_tensor)
+                # 增加 Token 维度 -> [B, S, 1, D]
+                state_tokens = state_emb.unsqueeze(2)
                 tokens_list.append(state_tokens)
 
-        combined = torch.cat(tokens_list, dim=2)  # (B, S, total_tokens, D)
-
-        # 4. 展平时间步 S
-        # 最终形状: [B, S * All_Tokens_Per_Step, D]
-        # DiT 会自动处理这个长序列的 Positional Embedding (因为它认为 length = n_obs_steps 参数)
-        #global_cond = einops.rearrange(combined, "b s t d -> b (s t) d")
-        global_cond = combined
+        # ---------------------------------------------------------------------
+        # 3. Concatenate & Return
+        # ---------------------------------------------------------------------
+        # 在 Token 维度拼接: Vision + State
+        # Shape: [B, S, Total_Tokens_Per_Step, D]
+        combined = torch.cat(tokens_list, dim=2)
         
-        return global_cond
+        # DiT 接受 [B, Total_Seq_Len, D] 或 [B, S, T, D] 取决于具体实现
+        # 这里返回 [B, S, T, D]，DiT 内部通常会 flatten 前两个维度
+        return combined
 
     # ---------------------------
     # Inference sampling
     # ---------------------------
     def conditional_sample(self, batch_size: int, global_cond: Optional[Tensor] = None, generator=None, noise: Tensor | None = None) -> Tensor:
+        """
+        执行扩散去噪采样过程
+        """
         device = get_device_from_parameters(self)
         dtype = get_dtype_from_parameters(self)
 
+        # 1. 初始化噪声
         sample = (
-                    noise
-                    if noise is not None
-                    else torch.randn(
-                        size=(batch_size, self.config.horizon, self.config.action_feature.shape[0]),
-                        dtype=dtype,
-                        device=device,
-                        generator=generator,
-                    )
-                )
+            noise
+            if noise is not None
+            else torch.randn(
+                size=(batch_size, self.config.horizon, self.config.action_feature.shape[0]),
+                dtype=dtype,
+                device=device,
+                generator=generator,
+            )
+        )
+        
+        # 2. 设置时间步
         self.noise_scheduler.set_timesteps(self.num_inference_steps)
 
+        # 3. 逐步去噪
         for t in self.noise_scheduler.timesteps:
+            # 预测噪声/样本
             model_output = self.unet(
                 sample,
                 torch.full((batch_size,), t, dtype=torch.long, device=device),
                 global_cond=global_cond,
             )
-            # pass eta if scheduler supports it (DDIM uses eta)
+            
+            # Scheduler Step
+            # 兼容 DDIM eta 参数
+            step_kwargs = {"generator": generator}
             if "eta" in self.noise_scheduler.step.__code__.co_varnames:
-                step_out = self.noise_scheduler.step(model_output, t, sample, eta=getattr(self.config, "ddim_eta", 0.0), generator=generator)
-            else:
-                step_out = self.noise_scheduler.step(model_output, t, sample, generator=generator)
+                step_kwargs["eta"] = getattr(self.config, "ddim_eta", 0.0)
+                
+            step_out = self.noise_scheduler.step(model_output, t, sample, **step_kwargs)
+            
+            # 兼容不同 diffusers 版本的输出格式
             sample = getattr(step_out, "prev_sample", step_out)
 
         return sample
