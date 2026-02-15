@@ -160,100 +160,6 @@ class PerceiverResampler(nn.Module):
         return self.norm_out(latents)
 
 
-class DinoSiglipBackbone(nn.Module):
-    """
-    DINOv2 + SigLIP 双塔视觉 Backbone。
-    功能：
-    1. 并行提取特征。
-    2. 处理不同的 Patch Size 和输入分辨率（自动插值）。
-    3. 输出类似 ResNet 的 [B, C, H, W] 特征图。
-    """
-    def __init__(self, config):
-        super().__init__()
-        
-        self.dinov2_model_name = config.dinov2_model_name
-        self.siglip_model_name = config.siglip_model_name
-        self.vision_freeze = getattr(config, "vision_freeze", True)
-
-        # 1. 加载模型
-        try:
-            self.dinov2 = AutoModel.from_pretrained(self.dinov2_model_name)
-            self.siglip = SiglipVisionModel.from_pretrained(self.siglip_model_name)
-        except Exception as e:
-            logger.error(f"❌ Failed to load models. Check internet or cache.")
-            raise e
-        
-        # 获取各自的 Patch Size
-        self.dino_p = self.dinov2.config.patch_size
-        self.siglip_p = self.siglip.config.patch_size
-
-        # 2. 冻结参数
-        if self.vision_freeze:
-            self.dinov2.requires_grad_(False)
-            self.siglip.requires_grad_(False)
-            self.dinov2.eval()
-            self.siglip.eval()
-        else:
-            self.dinov2.train()
-            self.siglip.train()
-
-    def _process_feature_map(self, feat, H, W, patch_size, model_name):
-        """
-        内部辅助函数：处理 CLS Token 并将序列还原为网格
-        """
-        B, N, D = feat.shape
-        grid_h, grid_w = H // patch_size, W // patch_size
-        expected_patches = grid_h * grid_w
-
-        # 1. 检查并移除 CLS Token
-        # 如果序列长度比网格多1，说明有CLS token
-        if N == expected_patches + 1:
-            feat = feat[:, 1:, :]
-            N -= 1
-        
-        # 2. 严格的形状检查 (Safety Check)
-        if N != expected_patches:
-            raise ValueError(f"Shape Mismatch in {model_name}: {N} vs {expected_patches}")
-
-        # 3. Reshape & Permute
-        # [B, N, D] -> [B, h, w, D] -> [B, D, h, w]
-        grid = feat.view(B, grid_h, grid_w, D).permute(0, 3, 1, 2)
-        return grid
-
-    def forward(self, x):
-        # x: [B, 3, H, W]
-        if x.dim() != 4:
-            raise ValueError(f"Expected input shape [B, 3, H, W], got {x.shape}")
-            
-        B, C, H, W = x.shape
-        
-        # -----------------------------------------------------------
-        # 1. 前向传播
-        # -----------------------------------------------------------
-        # 根据是否冻结决定是否使用 no_grad，节省显存
-        context = torch.no_grad() if self.vision_freeze else torch.enable_grad()
-        
-        with context:
-            # DINOv2
-            dinov2_feat = self.dinov2(x).last_hidden_state
-            
-            # SigLIP (必须开启 interpolate_pos_encoding)
-            siglip_feat = self.siglip(x, interpolate_pos_encoding=True).last_hidden_state
-
-        # -----------------------------------------------------------
-        # 2. 还原为网格 (Grid)
-        # -----------------------------------------------------------
-        
-        # 处理 DINOv2
-        dino_grid = self._process_feature_map(dinov2_feat, H, W, self.dino_p, self.dinov2_model_name)
-        
-
-        # 处理 SigLIP
-        siglip_grid = self._process_feature_map(siglip_feat, H, W, self.siglip_p, self.siglip_model_name)
-
-        return dino_grid.contiguous(), siglip_grid.contiguous()
-
-
 class DinoSiglipRGBEncoder(nn.Module):
     """
     DINO + SigLIP 双塔视觉编码器 (Dual-Tower Vision Encoder)
@@ -262,10 +168,10 @@ class DinoSiglipRGBEncoder(nn.Module):
     1. 并行运行 SigLIP (语义强) 和 DINO (几何强) 模型。
     2. 支持 DINOv2 和 DINOv3 (通过 AutoModel 加载)。
     3. 分别处理两种模型的不同归一化需求。
-    4. 输出拼接后的 Token 序列，供下游 (如 Perceiver Resampler) 使用。
+    4. 输出拼接后的 Token 序列, Patch 在特征维度拼接并融合, Cls 在数量上进行融合。
     
     输出形状:
-        [Batch, N_siglip + N_dino, projection_dim]
+        [Batch, N_patches + 1, projection_dim]
     """
 
     def __init__(self, config):
@@ -359,12 +265,17 @@ class DinoSiglipRGBEncoder(nn.Module):
         self.dino_p = self.dino.config.patch_size
         grid_dino = (h // self.dino_p) * (w // self.dino_p)
         
+        # 检查 Patch Size 是否一致，否则无法在特征维度对齐拼接
+        if self.siglip_p != self.dino_p:
+            logger.warning(f"⚠️ Warning: SigLIP Patch ({self.siglip_p}) != DINO Patch ({self.dino_p}). "
+                           "Feature concatenation requires spatial alignment. Ensure your models match or resize/interpolate is handled.")
+
         # 检查是否有寄存器 token (DINOv2-registers 模型)
         self.num_registers = getattr(self.dino.config, "num_register_tokens", 0)
         self.num_dino_tokens = grid_dino + 1 # +1 是 CLS Token
 
         # 总 Token 数
-        self.num_patches = self.num_siglip_tokens + self.num_dino_tokens
+        self.num_patches = self.num_siglip_tokens + 1
 
         # =========================================================================
         # 5. 特征投影层 (Feature Projection)
@@ -380,6 +291,12 @@ class DinoSiglipRGBEncoder(nn.Module):
         self.norm_siglip = nn.LayerNorm(target_dim)
         self.norm_dino = nn.LayerNorm(target_dim)
         
+        self.fusion_map = nn.Sequential(
+            nn.Linear(target_dim * 2, target_dim),
+            nn.GELU(),
+            nn.Linear(target_dim, target_dim)
+        )
+
         self.feature_dim = target_dim
 
         self._log_init_info(target_dim, h, w)
@@ -470,19 +387,25 @@ class DinoSiglipRGBEncoder(nn.Module):
             patch_tokens = raw_dino_feat[:, patch_start_idx:, :]
             
             # C. 拼接回: [CLS, Patches]
-            dino_feat = torch.cat([cls_token, patch_tokens], dim=1)
+            #dino_feat = torch.cat([cls_token, patch_tokens], dim=1)
 
         # 3. 投影与归一化 (Project & Normalize)
         # 将不同维度的特征映射到同一维度 (如 384)
         siglip_tokens = self.norm_siglip(self.proj_siglip(siglip_feat))
-        dino_tokens = self.norm_dino(self.proj_dino(dino_feat))
+        dino_patches_tokens = self.norm_dino(self.proj_dino(patch_tokens))
+        dino_cls_token = self.norm_dino(self.proj_dino(cls_token))
         
-        # 4. 拼接 (Concatenation)
-        # 在序列维度拼接: [B, N_sig + N_dino, D]
-        # 下游的 Perceiver Resampler 会负责处理这个变长的序列
-        combined_tokens = torch.cat([siglip_tokens, dino_tokens], dim=1)
+        # 4. Patch 特征融合 (Feature Fusion)
+        # [B, N, D] + [B, N, D] -> Cat(dim=-1) -> [B, N, 2D] -> Linear -> [B, N, D]
+        combined_patches = torch.cat([siglip_tokens, dino_patches_tokens], dim=-1)
+        combined_tokens = self.fusion_map(combined_patches)
 
-        return combined_tokens
+        # 5. 最终拼接 (Final Sequence Concatenation)
+        # 形状变化:
+        # CLS [B, 1, D] + Fused Patches [B, N, D] -> [B, 1+N, D]
+        output_tokens = torch.cat([dino_cls_token, combined_tokens], dim=1)
+
+        return output_tokens
 
 class SiglipRGBEncoder(nn.Module):
     """

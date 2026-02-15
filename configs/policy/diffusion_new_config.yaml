@@ -9,7 +9,7 @@ hydra:  # Hydra config directory, for parameter checking only
     subdir: ${hydra:job.override_dirname}
 
 task: "Task1"  # Custom task name. If using huggingface datasets instead of local dataset...
-method: "dino_siglip_lora_AdaLN"  # Custom method name
+method: "dino_siglip_lora_AdaLN_v2"  # Custom method name
 timestamp: ${now:%Y%m%d_%H%M%S}  # Auto-obtained timestamp
 repoid: "lerobot/${task}"  # Newer versions of lerobot require this, for lerobot reference only.
 root: "/home/liangweiqing/data/code/kuavo_data_challenge_icra/datasets/Task1"  # Locally converted lerobot dataset directory
@@ -41,7 +41,7 @@ training:
 
     # resume training
     resume: false
-    resume_timestamp: "run_20251120_164240"  # If enabled, it will pull the last epoch from outputs/train/<task>/<method>/<resume_timestamp> to continue training
+    resume_timestamp: "run_20260211_150636"  # If enabled, it will pull the last epoch from outputs/train/<task>/<method>/<resume_timestamp> to continue training
 
     # Data augmentation related config
     RGB_Augmenter:
@@ -144,8 +144,8 @@ policy:
       ddim_eta: 0.1 # eta for ddim
 
       # === Perceiver Resampler 配置 ===
-      use_perceiver: True          # 开启 Token 压缩
-      perceiver_num_queries: 128   # 压缩后的 Token 数量 (建议 32-64)
+      use_perceiver: False          # 开启 Token 压缩
+      perceiver_num_queries: 256   # 压缩后的 Token 数量 (建议 32-64)
       perceiver_depth: 2           # Resampler 的层数 (通常 1 或 2 足够)
 
       # === 视觉模型名称与路径 ===

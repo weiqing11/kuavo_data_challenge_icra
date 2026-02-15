@@ -8,13 +8,13 @@ MODE=${1:-"2"}
 
 case $MODE in
     "1")
-        echo "使用配置 [1]: IDP3 (no_rgb)"
+        echo "使用配置 [1]: IDP3 (no_rgb)"·
         SRC="/home/wushihan/data/Codes/kuavo_data_challenge_icra/outputs/train/idp3_v2_no_rgb/idp3"
         DEST="/home/humanoid/liangweiqing/code/kuavo_data_challenge_icra/outputs/train/idp3_v2_no_rgb"
         ;;
     "2")
         echo "使用配置 [2]: Task1 (baseline)"
-        SRC="/home/liangweiqing/data/code/kuavo_data_challenge_icra/outputs/train/Task1/dino_siglip_lora_AdaLN"
+        SRC="/home/liangweiqing/data/code/kuavo_data_challenge_icra/outputs/train/Task1/dino_siglip_lora_AdaLN_v2"
         DEST="/home/agilex/liangweiqing/kdc/kuavo_data_challenge_icra/outputs/train/Task1"
         ;;
     *)
