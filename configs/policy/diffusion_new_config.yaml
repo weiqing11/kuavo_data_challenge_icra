@@ -9,7 +9,7 @@ hydra:  # Hydra config directory, for parameter checking only
     subdir: ${hydra:job.override_dirname}
 
 task: "Task1"  # Custom task name. If using huggingface datasets instead of local dataset...
-method: "dino_siglip_lora_AdaLN_v2"  # Custom method name
+method: "siglip_DFormer_daLN"  # Custom method name
 timestamp: ${now:%Y%m%d_%H%M%S}  # Auto-obtained timestamp
 repoid: "lerobot/${task}"  # Newer versions of lerobot require this, for lerobot reference only.
 root: "/home/liangweiqing/data/code/kuavo_data_challenge_icra/datasets/Task1"  # Locally converted lerobot dataset directory
@@ -27,11 +27,11 @@ training:
     save_freq_epoch: 10  # Training parameter save frequency. 10 epoch per saved weights
     log_freq: 1  # Progress bar refresh frequency. 1 = Every iteration step.
     device: "cuda" # Training device. Single GPU only by default. Systems with multiple GPU's please use CUDA_VISIBLE_DEVICES=6 as an envionment variable. cuda:6 might not work.
-    accumulation_steps: 4  # Grad accumulation step
+    accumulation_steps: 8  # Grad accumulation step
     ema_power: 0.75  # This parameter can be used if the EMA (Equation of Mobility) moving exponential average method is employed.
     # However, current testing shows that using EMA causes performance degradation, so it is no longer supported in the code.
     
-    batch_size: 8  # Batch size. Adjust as needed.
+    batch_size: 4  # Batch size. Adjust as needed.
     num_workers: 8  # dataloader's num_workers. Adjust as needed per your computer's performance. Setting it too high might lock up your computer
     drop_last: False  # Whether to drop the last incomplete batch
 
@@ -73,7 +73,7 @@ policy:
     n_action_steps: 8
     drop_n_last_frames: 7  # Drop the last n frames
 
-    vision_backbone: "dino+siglip" #"siglip_only"
+    vision_backbone: "siglip_dformer" #"siglip_only"
 
     normalization_mapping: # RGB is equivalent to VISUAL type. diffusion also supports depth data. These two parameters are used to set the normalization method.
       VISUAL: { _target_: lerobot.configs.types.NormalizationMode, value: IDENTITY }
@@ -120,8 +120,7 @@ policy:
     # =========================================================
     custom:  # Custom configs. Special adjustments based on the lerobot diffusion policy, including depth support. You may refer to related codes for details
       # support depth image
-      use_depth: false #false
-      depth_encoder_type: "DEPTH" #"RGBD"
+      use_depth: true #false
       depth_backbone: resnet18
       use_separate_depth_encoder_per_camera: False
 

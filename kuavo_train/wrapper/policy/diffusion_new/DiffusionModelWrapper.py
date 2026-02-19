@@ -407,6 +407,7 @@ class DinoSiglipRGBEncoder(nn.Module):
 
         return output_tokens
 
+
 class SiglipRGBEncoder(nn.Module):
     """
     SigLIP 视觉编码器 (SigLIP Vision Encoder)
@@ -570,241 +571,127 @@ class SiglipRGBEncoder(nn.Module):
 
         return tokens
 
+
 class DFomerRGBDBackbone(nn.Module):
     def __init__(self, config):
         """
-        初始化 DFormer RGB-D backbone
-        
-        Args:
-            model_size (str): 模型规格，可选 'small', 'base', 'large'
-            pretrained_path (str, optional): 预训练权重路径 (.pth). 默认为 None.
-            freeze_backbone (bool): 是否冻结骨干网络参数 (用于微调下游任务). 默认为 False.
+        初始化 DFormer RGB-D backbone，默认支持全量微调。
         """
         super().__init__()
         model_name = config.vision_backbone_rgbd
         pretrained_path = config.DFormer_path
-        vision_freeze = config.vision_freeze
+        # 即使全局 vision_freeze 为 True，也可以通过配置单独控制 DFormer 是否微调
+        self.vision_freeze = getattr(config, "vision_freeze", False) 
         self.model_size = model_name.split("_")[-1]
-        
-        # 1. 配置映射 (用于实例化和日志展示)
-        # ---------------------------------------------------------
+
         configs = {
             'small': {'fn': DFormerv2_S, 'dims': [64, 128, 256, 512], 'desc': 'Small (High Speed)'},
             'base':  {'fn': DFormerv2_B, 'dims': [80, 160, 320, 512], 'desc': 'Base (Balanced)'},
             'large': {'fn': DFormerv2_L, 'dims': [112, 224, 448, 640], 'desc': 'Large (High Perf)'},
         }
-        
+
         if self.model_size not in configs:
-            logger.error(f"❌ Invalid model size: {self.model_size}")
-            raise ValueError(f"Choose from {list(configs.keys())}")
-            
+            raise ValueError(f"❌ Invalid DFormer size: {self.model_size}")
+
         cfg = configs[self.model_size]
         self.out_channels = cfg['dims']
-
-        # 2. 实例化 Backbone
-        # ---------------------------------------------------------
-        logger.info(f"🏗️  Building DFormer architecture: {Colors.CYAN}{cfg['desc']}{Colors.RESET}")
         self.backbone = cfg['fn']()
-        
-        # 计算参数量
-        total_params = sum(p.numel() for p in self.backbone.parameters())
-        param_str = f"{total_params / 1e6:.2f} M"
 
-        # 3. 加载权重
-        # ---------------------------------------------------------
+        # 加载权重
         if pretrained_path:
             try:
                 self.backbone.load_pretrained(pretrained_path)
             except Exception as e:
-                logger.error(f"Failed to load weights: {e}")
+                logger.error(f"Failed to load DFormer weights: {e}")
 
-        # 4. 冻结参数
-        # ---------------------------------------------------------
-        freeze_status = f"{Colors.RED}No (Trainable){Colors.RESET}"
-        if vision_freeze:
-            self._freeze_params()
+        # 冻结策略：除非明确指定，否则默认开启全量微调
+        if self.vision_freeze:
+            for param in self.backbone.parameters():
+                param.requires_grad = False
             freeze_status = f"{Colors.CYAN}Yes (Frozen ❄️){Colors.RESET}"
+        else:
+            freeze_status = f"{Colors.GREEN}No (Full Fine-Tuning 🔥){Colors.RESET}"
 
-        # 5. 打印 info
-        # ---------------------------------------------------------
-        info_dict = {
-            "Architecture": f"DFormer-v2 {self.model_size.title()}",
-            "Out Channels": str(self.out_channels),
-            "Total Params": param_str,
-            "Backbone Freeze": freeze_status,
-            "Input Mode": "RGB + Depth/Edge"
-        }
-        
-        log_box("DFormer RGBD Encoder Setup", info_dict, icon="🧠")
-
-    def _freeze_params(self):
-        """冻结 backbone 所有参数"""
-        for param in self.backbone.parameters():
-            param.requires_grad = False
+        total_params = sum(p.numel() for p in self.backbone.parameters())
+        log_box("DFormer Backbone Setup", {
+            "Size": self.model_size,
+            "Params": f"{total_params / 1e6:.2f} M",
+            "Fine-Tuning": freeze_status
+        })
 
     def forward(self, x, x_depth):
-        """
-        Args:
-            x (Tensor): RGB 图像 [B, 3, H, W]
-            x_depth (Tensor): 深度图/边缘图 [B, 1, H, W]
-            
-        Returns:
-            list[Tensor]: 多尺度特征列表
-                - Stage 1: [B, C1, H/4, W/4]
-                - Stage 2: [B, C2, H/8, W/8]
-                - Stage 3: [B, C3, H/16, W/16]
-                - Stage 4: [B, C4, H/32, W/32]
-        """
-        # 直接调用 DFormerv2 的 forward
-        features = self.backbone(x, x_depth)
-        
-        # DFormerv2 返回的是 tuple，通常转为 list 方便后续操作
-        return list(features)
+        # 返回多尺度特征列表
+        return list(self.backbone(x, x_depth))
 
     def get_out_channels(self):
-        """辅助函数：让 Decoder 知道每一层的通道数"""
         return self.out_channels
 
-
-class DFomerRGBDEncoder(nn.Module):
+class SiglipDFormerEncoder(nn.Module):
+    """
+    整理后的 SigLIP + DFormer 双塔编码器
+    用于将语义与 3D 几何特征融合为 Token 序列
+    """
     def __init__(self, config):
         super().__init__()
-
-        # 1. 初始化 Backbone
-        self.backbone = DFomerRGBDBackbone(config)
+        self.config = config
         
-        # 2. 获取通道和分辨率信息以初始化池化层
-        # 以 Base 版为例: [80, 160, 320, 512]
-        channels_list = self.backbone.get_out_channels()
-        
-        # 融合 Stage 2, 3, 4 的通道
-        self.total_fused_channels = sum(channels_list[1:]) # 160 + 320 + 512 = 992
-        
-        # 获取输入分辨率和 Stage 3 的网格大小 (用于 SpatialSoftmax)
-        first_img_shape = next(iter(config.image_features.values())).shape
-        h, w = config.resize_shape if config.resize_shape else first_img_shape[1:]
-        self.grid_h, self.grid_w = h // 16, w // 16 
-        
-        # 3. 初始化层次化 SpatialSoftmax
-        self.num_kp = config.spatial_softmax_num_keypoints
-        # 这里的 input_shape 必须匹配拼接后的 [C, H, W]
-        self.pool = SpatialSoftmax(
-            [self.total_fused_channels, self.grid_h, self.grid_w], 
-            num_kp=self.num_kp
+        # 1. 加载 SigLIP
+        siglip_is_local = "/" in config.siglip_model_name
+        self.siglip = SiglipVisionModel.from_pretrained(
+            config.siglip_model_name,
+            local_files_only=siglip_is_local
         )
         
-        # 4. 统一输出维度
-        self.feature_dim = self.num_kp * 2
-        self.out = nn.Sequential(
-            nn.Linear(self.feature_dim, self.feature_dim),
-            nn.ReLU()
+        # 2. 加载 DFormer (默认开启微调)
+        self.dformer_backbone = DFomerRGBDBackbone(config)
+        
+        # 3. 维度配置
+        target_dim = getattr(config, "transformer_n_emb", 384)
+        self.feature_dim = target_dim
+        self.siglip_dim = self.siglip.config.hidden_size
+        self.dformer_stage_idx = 2 # 使用 Stage 3 特征 (H/16, W/16)
+        self.dformer_dim = self.dformer_backbone.get_out_channels()[self.dformer_stage_idx]
+
+        # 4. 投影与融合层
+        self.proj_siglip = nn.Linear(self.siglip_dim, target_dim)
+        self.proj_dformer = nn.Linear(self.dformer_dim, target_dim)
+        self.norm = nn.LayerNorm(target_dim)
+        
+        self.fusion_map = nn.Sequential(
+            nn.Linear(target_dim * 2, target_dim),
+            nn.GELU(),
+            nn.Linear(target_dim, target_dim)
         )
 
-        # DEBUG
-        self.last_log_time = 0      # 上次保存图片的时间
-        self.log_interval = 600.0    # 设定间隔：30 秒 (你可以随意改)
+        # 5. Token 数量预计算
+        h, w = config.resize_shape if config.resize_shape else (224, 224)
+        self.patch_size = self.siglip.config.patch_size
+        self.num_patches_h, self.num_patches_w = h // self.patch_size, w // self.patch_size
+        self.num_patches = self.num_patches_h * self.num_patches_w
 
     def forward(self, rgb: torch.Tensor, depth: torch.Tensor) -> torch.Tensor:
-        feats = self.backbone(rgb, depth)
-        f2, f3, f4 = feats[1], feats[2], feats[3]
-        
-        target_size = (self.grid_h, self.grid_w)
-        f2_p = F.adaptive_avg_pool2d(f2, target_size) 
-        f3_p = F.adaptive_avg_pool2d(f3, target_size) 
-        
-        f4_aligned = F.interpolate(f4, size=target_size, mode='bilinear', align_corners=False)
-        
-        # 多尺度特征拼接
-        # 形状变化: [B, 992, H, W] (即 160+320+512)
-        fused_map = torch.cat([f2_p, f3_p, f4_aligned], dim=1)
-        
-        # Step 4: Spatial Softmax 提取坐标
-        # 内部会进行 1x1 卷积将 992 通道投影到 num_kp
-        # 形状变化: [B, num_kp, 2] (即 64个关键点的 x,y 坐标)
-        kp = self.pool(fused_map)
-        
-        # [DEBUG START] ==========================================================
-        # 无条件执行：每次都画图，覆盖同一张文件
-        current_time = time.time()
-        
-        # 如果距离上次打印超过了设定的间隔
-        if current_time - self.last_log_time > self.log_interval:
-            # 立即更新时间戳 (防止短时间内多次进入)
-            self.last_log_time = current_time
+        # A. SigLIP 分支 (RGB 语义)
+        siglip_out = self.siglip(rgb, interpolate_pos_encoding=True)
+        sig_tokens = self.proj_siglip(siglip_out.last_hidden_state) # [B, N, D]
 
-            try:
-                # 选取 Batch 第 0 张
-                idx = 0
-                
-                # --- 数据准备 (转 Numpy) ---
-                # RGB
-                rgb_vis = rgb[idx].detach().cpu().permute(1, 2, 0).numpy()
-                rgb_vis = (rgb_vis - rgb_vis.min()) / (rgb_vis.max() - rgb_vis.min() + 1e-8)
-                
-                # Depth (降维 [1, H, W] -> [H, W])
-                depth_vis = depth[idx].detach().cpu().squeeze(0).numpy()
-                depth_vis = (depth_vis - depth_vis.min()) / (depth_vis.max() - depth_vis.min() + 1e-8)
+        # B. DFormer 分支 (RGB-D 几何)
+        df_feats = self.dformer_backbone(rgb, depth)
+        df_map = df_feats[self.dformer_stage_idx] # [B, C_df, H/16, W/16]
 
-                # Feature Map (Mean across channels)
-                heatmap_tensor = fused_map[idx].mean(dim=0)
-                heatmap_vis = heatmap_tensor.detach().cpu().numpy()
-                
-                # Keypoints (还原到像素坐标)
-                kps = kp[idx].detach().cpu().numpy() # [num_kp, 2]
-                H, W = rgb_vis.shape[:2]
-                
-                # 假设 SpatialSoftmax 输出范围 [-1, 1]
-                kp_x = (kps[:, 0] + 1) / 2 * W
-                kp_y = (kps[:, 1] + 1) / 2 * H
-                
-                # --- 绘图 ---
-                # 创建画布 (如果不 close 会内存泄露，所以下面必须 close)
-                fig, axes = plt.subplots(1, 4, figsize=(20, 5))
-                
-                # 1. RGB
-                axes[0].imshow(rgb_vis)
-                axes[0].set_title("RGB Input")
-                axes[0].axis('off')
-                
-                # 2. Depth
-                axes[1].imshow(depth_vis, cmap='magma')
-                axes[1].set_title("Depth Input")
-                axes[1].axis('off')
-
-                # 3. Features
-                axes[2].imshow(heatmap_vis, cmap='viridis')
-                axes[2].set_title(f"Fused Features")
-                axes[2].axis('off')
-                
-                # 4. Result Overlay
-                axes[3].imshow(rgb_vis)
-                axes[3].scatter(kp_x, kp_y, c='red', s=30, marker='x', alpha=0.7)
-                axes[3].set_title(f"Spatial Softmax")
-                axes[3].axis('off')
-                
-                # 保存并覆盖
-                save_path = "debug_dformer_latest.png"
-                plt.tight_layout()
-                plt.savefig(save_path)
-                plt.close(fig) # 关键：释放内存
-                
-                # 可选：打印一句提示，如果你觉得刷屏太快可以注释掉
-                # print(f"📸 [DEBUG] Updated: {save_path}")
-                
-            except Exception as e:
-                print(f"❌ [DEBUG] Vis Error: {e}")
-        # [DEBUG END] ============================================================
-
-        # Step 5: 展平并对齐维度
-        # 形状变化: [B, num_kp * 2] (即 128 维特征向量)
-        x = torch.flatten(kp, start_dim=1)
+        # C. 空间对齐
+        if df_map.shape[2:] != (self.num_patches_h, self.num_patches_w):
+            df_map = F.interpolate(df_map, size=(self.num_patches_h, self.num_patches_w), 
+                                 mode='bilinear', align_corners=False)
         
-        # Step 6: 最终投影与激活
-        # 形状: [B, 128]
-        # 此时输出维度完全匹配 DinoSiglipRGBEncoder.feature_dim
-        x = self.out(x)
+        # D. 转换为 Token 并映射维度
+        df_tokens = df_map.flatten(2).transpose(1, 2) # [B, N, C_df]
+        df_tokens = self.proj_dformer(df_tokens) # [B, N, D]
+
+        # E. 特征拼接与融合
+        combined = torch.cat([sig_tokens, df_tokens], dim=-1) # [B, N, 2*D]
+        fused_tokens = self.fusion_map(combined)
         
-        return x
+        return self.norm(fused_tokens)
 
 
 class ResnetRgbEncoder(nn.Module):
@@ -902,30 +789,26 @@ class DiffusionRgbEncoder(nn.Module):
     def __init__(self, config: CustomDiffusionConfigWrapper):
         super().__init__()
         self.config = config
-        if "resnet" in config.vision_backbone:
+        backbone_type = config.vision_backbone
+        
+        if "resnet" in backbone_type:
             self.model = ResnetRgbEncoder(config)
-        elif "dino" in config.vision_backbone and "siglip" in config.vision_backbone:
+        elif "dino" in backbone_type and "siglip" in backbone_type:
             self.model = DinoSiglipRGBEncoder(config)
-        elif "siglip_only" in config.vision_backbone:
+        elif "siglip_dformer" in backbone_type: 
+            self.model = SiglipDFormerEncoder(config)
+        elif "siglip_only" in backbone_type:
             self.model = SiglipRGBEncoder(config)
         else:
             raise ValueError(f"Unknown vision backbone: {config.vision_backbone}")
+            
         self.feature_dim = self.model.feature_dim
-    def forward(self, x: Tensor) -> Tensor:
+        self.is_rgbd_encoder = "siglip_dformer" in backbone_type 
+    
+    def forward(self, x: Tensor, x_depth: Optional[Tensor] = None) -> Tensor:
+        if self.is_rgbd_encoder:
+            return self.model(x, x_depth)
         return self.model(x)
-
-
-class DiffusionRGBDEncoder(nn.Module):
-    def __init__(self, config: CustomDiffusionConfigWrapper):
-        super().__init__()
-        self.config = config
-        if "DFormer" in config.vision_backbone_rgbd:
-            self.model = DFomerRGBDEncoder(config)
-        else:
-            raise ValueError(f"Unknown RGBD backbone: {config.vision_backbone_rgbd}")
-        self.feature_dim = self.model.feature_dim
-    def forward(self, x: Tensor, x_depth: Tensor) -> Tensor:
-        return self.model(x, x_depth)
 
 
 class DiffusionDepthEncoder(nn.Module):
@@ -1202,7 +1085,13 @@ class CustomDiffusionModelWrapper(DiffusionModel):
             else:
                 # 共享编码器：输入 [B*S*N_cam, C, H, W] -> 输出 [B*S*N_cam, N_patches, D]
                 imgs = einops.rearrange(batch[OBS_IMAGES], "b s n ... -> (b s n) ...")
-                vis_feats = self.rgb_encoder(imgs)
+
+                depths = None
+                if OBS_DEPTH in batch:
+                    depths = batch[OBS_DEPTH] 
+                    depths = einops.rearrange(depths, "b s n c h w -> (b s n) c h w")
+                
+                vis_feats = self.rgb_encoder(imgs, depths)
                 # 重排并拼接 -> [B*S, N_cam * N_patches, D]
                 vis_tokens = einops.rearrange(vis_feats, "(b s n) p d -> (b s) (n p) d", b=B, s=S)
 
