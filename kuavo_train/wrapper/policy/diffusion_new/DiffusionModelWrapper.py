@@ -581,7 +581,7 @@ class DFomerRGBDBackbone(nn.Module):
         model_name = config.vision_backbone_rgbd
         pretrained_path = config.DFormer_path
         # 即使全局 vision_freeze 为 True，也可以通过配置单独控制 DFormer 是否微调
-        self.vision_freeze = getattr(config, "vision_freeze", False) 
+        self.vision_freeze = False
         self.model_size = model_name.split("_")[-1]
 
         configs = {
@@ -642,7 +642,31 @@ class SiglipDFormerEncoder(nn.Module):
             local_files_only=siglip_is_local
         )
         
-        # 2. 加载 DFormer (默认开启微调)
+        # ==================== 修复：新增 LoRA 与冻结逻辑 ====================
+        self.use_lora = getattr(config, "use_lora", False)
+        # 获取全局冻结配置，默认 True (冻结)
+        self.vision_freeze = getattr(config, "vision_freeze", True)
+        
+        if self.use_lora:
+            # logger.info(f"🔧 Applying LoRA to SigLIP Backbone...") # 如果有logger可以解除注释
+            peft_config = LoraConfig(
+                r=getattr(config, "lora_rank", 16),
+                lora_alpha=getattr(config, "lora_alpha", 32),
+                target_modules=["q_proj", "k_proj", "v_proj", "out_proj", "fc1", "fc2"],
+                lora_dropout=getattr(config, "lora_dropout", 0.05),
+                bias="none",
+            )
+            # get_peft_model 会自动冻结 SigLIP 的主干参数，只允许 LoRA 层求导
+            self.siglip = get_peft_model(self.siglip, peft_config)
+            
+        elif self.vision_freeze:
+            # 如果不使用 LoRA 且开启了冻结，则强行冻结 SigLIP 全参
+            for param in self.siglip.parameters():
+                param.requires_grad = False
+            self.siglip.eval()
+        # ===================================================================
+        
+        # 2. 加载 DFormer (其内部已经根据 config.vision_freeze 做了冻结判断)
         self.dformer_backbone = DFomerRGBDBackbone(config)
         
         # 3. 维度配置
@@ -650,7 +674,10 @@ class SiglipDFormerEncoder(nn.Module):
         self.feature_dim = target_dim
         self.siglip_dim = self.siglip.config.hidden_size
         self.dformer_stage_idx = 2 # 使用 Stage 3 特征 (H/16, W/16)
-        self.dformer_dim = self.dformer_backbone.get_out_channels()[self.dformer_stage_idx]
+        
+        # 获取 DFormer 的输出通道数
+        dformer_channels = self.dformer_backbone.get_out_channels()
+        self.dformer_dim = dformer_channels[self.dformer_stage_idx]
 
         # 4. 投影与融合层
         self.proj_siglip = nn.Linear(self.siglip_dim, target_dim)
@@ -671,8 +698,16 @@ class SiglipDFormerEncoder(nn.Module):
 
     def forward(self, rgb: torch.Tensor, depth: torch.Tensor) -> torch.Tensor:
         # A. SigLIP 分支 (RGB 语义)
-        siglip_out = self.siglip(rgb, interpolate_pos_encoding=True)
-        sig_tokens = self.proj_siglip(siglip_out.last_hidden_state) # [B, N, D]
+        # 根据是否冻结决定是否使用 no_grad，节省显存
+        requires_grad = self.use_lora or (not self.vision_freeze)
+        context = torch.enable_grad() if requires_grad else torch.no_grad()
+        
+        with context:
+            siglip_out = self.siglip(rgb, interpolate_pos_encoding=True)
+            # 如果用了 PEFT，last_hidden_state 可能获取方式不变，但为了稳妥直接取索引或属性
+            sig_hidden = getattr(siglip_out, "last_hidden_state", siglip_out[0])
+            
+        sig_tokens = self.proj_siglip(sig_hidden) # [B, N, D]
 
         # B. DFormer 分支 (RGB-D 几何)
         df_feats = self.dformer_backbone(rgb, depth)
