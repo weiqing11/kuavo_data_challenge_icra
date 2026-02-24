@@ -136,7 +136,7 @@ class DiT(nn.Module):
         
         # State Embedder (AdaLN): 
         # 输入维度 = S * token_dim (我们将 S 个 State Token 展平)
-        self.state_embedder = ConditionEmbedder(n_obs_steps * token_dim, hidden_size)
+        self.state_embedder = ConditionEmbedder((n_obs_steps + 1) * token_dim, hidden_size)
         
         # 3. Transformer Blocks
         # ----------------------------------------------------------------------
@@ -200,8 +200,15 @@ class DiT(nn.Module):
         # ======================================================================
         # 2. 准备 AdaLN Condition (State + Time)
         # ======================================================================
-        # 将 S 个 State Token 展平为长向量: (B, S * D)
-        state_flat = state_tokens.reshape(B, -1)
+        if S > 1:
+            state_prev = state_tokens[:, 0, :]
+            state_curr = state_tokens[:, 1, :]
+            state_delta = state_curr - state_prev
+            
+            # 将它们拼接在一起: (B, 3 * D)
+            state_flat = torch.cat([state_prev, state_curr, state_delta], dim=-1)
+        else:
+            state_flat = state_tokens.reshape(B, -1)
         
         t_emb = self.t_embedder(timestep)        # (B, Hidden)
         s_emb = self.state_embedder(state_flat)  # (B, Hidden)

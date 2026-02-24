@@ -600,7 +600,7 @@ class DFomerRGBDBackbone(nn.Module):
         # 加载权重
         if pretrained_path:
             try:
-                self.backbone.load_pretrained(pretrained_path)
+                self.backbone.init_weights(pretrained_path)
             except Exception as e:
                 logger.error(f"Failed to load DFormer weights: {e}")
 
