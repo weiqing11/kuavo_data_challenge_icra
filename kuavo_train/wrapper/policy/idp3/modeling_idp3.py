@@ -221,9 +221,7 @@ class IDP3Model(nn.Module):
         # 截断到指定的通道数
         if inferred_channels != pc_channels:
             if pc_channels < inferred_channels:
-                    print(f"Warning: The provided pc_channels {pc_channels} "
-                        f"is less than inferred {inferred_channels}. "
-                        f"Auto cutting from {inferred_channels} to {pc_channels}.")
+                pass  # 如果预期的维度比实际拥有的还小，直接截断
             else:
                 # 如果预期的维度比实际拥有的还大，通常无法自动处理，建议报错
                 raise ValueError(f"Cannot upscale channels from {inferred_channels} to {pc_channels}")
@@ -231,7 +229,7 @@ class IDP3Model(nn.Module):
 
         # 合并批次与时间维度 -> (B * T, N, C_out)
         point_cloud = point_cloud.reshape(-1, num_points, pc_channels)
-        
+        # raise ValueError("Check if this is correct to reshape point cloud to (B * T, N, C) for the pointnet encoder. Current shape is ", point_cloud.shape)
         return point_cloud
 
     # ========= inference  ============

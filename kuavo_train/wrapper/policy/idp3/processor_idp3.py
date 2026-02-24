@@ -21,7 +21,6 @@ from lerobot.processor.converters import policy_action_to_transition, transition
 from lerobot.processor.pipeline import ObservationProcessorStep
 from lerobot.utils.constants import POLICY_POSTPROCESSOR_DEFAULT_NAME, POLICY_PREPROCESSOR_DEFAULT_NAME
 from dataclasses import dataclass
-from kuavo_data.common.pcd_utils_cpu import augmentation
 
 
 def make_idp3_pre_post_processors(

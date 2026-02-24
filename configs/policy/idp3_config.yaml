@@ -6,11 +6,11 @@ hydra:
     subdir: ${hydra:job.override_dirname}
 
 # Task/dataset
-task: "idp3_3v_no_rgb"
-method: "idp3"
+task: "idp3_3v"
+method: "2048_3"
 timestamp: ${now:%Y%m%d_%H%M%S}
 repoid: "lerobot/${task}"
-root: "/home/wushihan/data/Codes/kuavo_data_challenge_icra/dataset/kdc_pcd_3view/Task1_3v_fps/lerobot"
+root: "/home/wushihan/data/Codes/kuavo_data_challenge_icra/dataset/kdc_pcd_3view/Task1_3v_fps_4096_6/lerobot"
 
 training:
   output_directory: "outputs/train/${task}/${method}"
@@ -29,8 +29,8 @@ training:
 
   max_training_step: null
 
-  resume: True
-  resume_timestamp: "/home/wushihan/data/Codes/kuavo_data_challenge_icra/outputs/train/idp3_3v_no_rgb/idp3/run_20260209_181638"
+  resume: false
+  resume_timestamp: ""
 
   RGB_Augmenter:
     enable: False # 点云不需要用到RGB数据增强
@@ -80,12 +80,12 @@ policy:
 
   # Point cloud encoder
   pointcloud_encoder_cfg:
-    in_channels: 6
+    in_channels: 3
     out_channels: 128
     use_layernorm: true
     final_norm: "layernorm"
     normal_channel: false
-    num_points: 4096
+    num_points: 2048
     state_dim: 16
 
   # Diffusion-related

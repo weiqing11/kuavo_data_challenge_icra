@@ -177,6 +177,9 @@ class IDP3Config(PreTrainedConfig):
     image_features = None  # TODO: Perhaps treat pointcloud as an environemnt state feature would fit better with the current implementation
 
     def __post_init__(self):
+        if isinstance(self.pointcloud_encoder_cfg, (dict, DictConfig)):
+            self.pointcloud_encoder_cfg = IDP3Config.PointCloudEncoderConfig(**self.pointcloud_encoder_cfg)
+
         super().__post_init__()
 
         """Input validation (not exhaustive)."""
