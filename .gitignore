@@ -217,9 +217,12 @@ ana.py
 *.tar
 error.txt
 obs.png
-datasets/
+datasets
 *.mp4
 *.ply
 *.png
 /zyh_tmp
 /discuss
+/tmp
+/dinov2
+/dinov3

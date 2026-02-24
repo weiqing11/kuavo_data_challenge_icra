@@ -25,21 +25,6 @@ T = TypeVar("T", bound="CustomDiffusionConfigWrapper")
 class CustomDiffusionConfigWrapper(DiffusionConfig):
     custom: Dict[str, Any] = field(default_factory=dict)
 
-    # ====================在这里添加！====================
-    # 必须显式声明类型，Hydra 才能把 yaml 里的值传进来
-    vision_backbone_rgbd: str = None
-    dinov2_model_name: str = None
-    siglip_model_name: str = None
-    DFormer_path: str = None
-    vision_freeze: bool = True
-    vision_encoder_mode: str = None
-    vision_attn_heads: int = None
-    vision_fusion_dim: int = None
-    use_lora: bool = None
-    lora_rank: int = None
-    lora_alpha: int = None
-    # ==================================================
-
     def __post_init__(self):
         vision_backbone = self.vision_backbone
         self.vision_backbone = "resnet18"

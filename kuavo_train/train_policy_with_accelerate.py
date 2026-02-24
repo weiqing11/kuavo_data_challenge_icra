@@ -300,7 +300,6 @@ def main(cfg: DictConfig):
 
     dataset_info = {
         "Repo ID": cfg.repoid,
-        "Camera Keys": dataset_metadata.camera_keys,
         "Total Frames": dataset_metadata.info["total_frames"],
         "FPS": dataset_metadata.fps
     }
@@ -309,17 +308,27 @@ def main(cfg: DictConfig):
     # 打印模型参数量
     num_total_params = sum(p.numel() for p in policy.parameters())
     num_learnable_params = sum(p.numel() for p in policy.parameters() if p.requires_grad)
-    
+    trainable_ratio = num_learnable_params / num_total_params
+
     model_stats = {
         "Total Parameters": f"{num_total_params:,}",
         "Learnable Params": f"{num_learnable_params:,}",
         "Frozen Params": f"{num_total_params - num_learnable_params:,}",
-        "Learnable Ratio": f"{(num_learnable_params / num_total_params) * 100:.2f}%"
+        "Learnable Ratio": f"{trainable_ratio * 100:.2f}%"
     }
+    
     # 根据是否冻结显示不同的图标
-    status_icon = "❄️" if num_learnable_params < num_total_params else "🔥"
-    log_box("Model Statistics", model_stats, icon=status_icon)
-
+    if trainable_ratio <= 0:
+        status_icon = "❄️"  # 完全冻结 (Frozen)
+        status_text = "Frozen (Inference Only)"
+    elif trainable_ratio < 1:  
+        status_icon = "⚡"  # vision部分微调 (LoRA / PEFT) + DiT全量训练
+        status_text = f"PEFT/LoRA (Trainable: {trainable_ratio:.2%})"
+    else:
+        status_icon = "🔥"  # 全量训练 (Full Finetune)
+        status_text = "Full Fine-Tuning"
+    
+    log_box(status_text, model_stats, icon=status_icon)
 
     # Build dataset and dataloader
     delta_timestamps = build_delta_timestamps(dataset_metadata, policy_cfg)

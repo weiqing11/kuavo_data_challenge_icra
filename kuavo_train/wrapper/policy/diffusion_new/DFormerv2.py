@@ -16,12 +16,12 @@ import torch.utils.checkpoint as checkpoint
 import math
 from timm.models.layers import DropPath, trunc_normal_
 from typing import List
+from mmengine.runner.checkpoint import load_state_dict
+from mmengine.runner.checkpoint import load_checkpoint
 from typing import Tuple
 import sys
 import os
 from collections import OrderedDict
-
-from kuavo_train.logger import logger, log_box, Colors
 
 
 class LayerNorm2d(nn.Module):
@@ -491,9 +491,10 @@ class BasicLayer(nn.Module):
             return x, x
 
 
-class DFormerv2(nn.Module):
+class dformerv2(nn.Module):
     def __init__(
         self,
+        out_indices=(0, 1, 2, 3),
         embed_dims=[64, 128, 256, 512],
         depths=[2, 2, 8, 2],
         num_heads=[4, 4, 8, 16],
@@ -501,97 +502,174 @@ class DFormerv2(nn.Module):
         heads_ranges=[4, 4, 6, 6],
         mlp_ratios=[4, 4, 3, 3],
         drop_path_rate=0.1,
-        out_indices=(0, 1, 2, 3),
+        norm_layer=nn.LayerNorm,
+        patch_norm=True,
+        use_checkpoint=False,
+        projection=1024,
+        norm_cfg=None,
         layerscales=[False, False, False, False],
         layer_init_values=1e-6,
+        norm_eval=True,
     ):
         super().__init__()
         self.out_indices = out_indices
-        self.patch_embed = PatchEmbed(in_chans=3, embed_dim=embed_dims[0])
-        
+        self.num_layers = len(depths)
+        self.embed_dim = embed_dims[0]
+        self.patch_norm = patch_norm
+        self.num_features = embed_dims[-1]
+        self.mlp_ratios = mlp_ratios
+        self.norm_eval = norm_eval
+
+        # patch embedding
+        self.patch_embed = PatchEmbed(
+            in_chans=3, embed_dim=embed_dims[0], norm_layer=norm_layer if self.patch_norm else None
+        )
+
+        # drop path rate
         dpr = [x.item() for x in torch.linspace(0, drop_path_rate, sum(depths))]
+
+        # build layers
         self.layers = nn.ModuleList()
 
-        for i in range(len(depths)):
+        for i_layer in range(self.num_layers):
             layer = BasicLayer(
-                embed_dim=embed_dims[i],
-                out_dim=embed_dims[i + 1] if (i < len(depths) - 1) else None,
-                depth=depths[i],
-                num_heads=num_heads[i],
-                init_value=init_values[i],
-                heads_range=heads_ranges[i],
-                ffn_dim=int(mlp_ratios[i] * embed_dims[i]),
-                drop_path=dpr[sum(depths[:i]) : sum(depths[: i + 1])],
-                split_or_not=(i != 3),
-                downsample=PatchMerging if (i < len(depths) - 1) else None,
-                layerscale=layerscales[i],
+                embed_dim=embed_dims[i_layer],
+                out_dim=embed_dims[i_layer + 1] if (i_layer < self.num_layers - 1) else None,
+                depth=depths[i_layer],
+                num_heads=num_heads[i_layer],
+                init_value=init_values[i_layer],
+                heads_range=heads_ranges[i_layer],
+                ffn_dim=int(mlp_ratios[i_layer] * embed_dims[i_layer]),
+                drop_path=dpr[sum(depths[:i_layer]) : sum(depths[: i_layer + 1])],
+                norm_layer=norm_layer,
+                split_or_not=(i_layer != 3),
+                downsample=PatchMerging if (i_layer < self.num_layers - 1) else None,
+                use_checkpoint=use_checkpoint,
+                layerscale=layerscales[i_layer],
                 layer_init_values=layer_init_values,
             )
             self.layers.append(layer)
 
-        self.extra_norms = nn.ModuleList([nn.LayerNorm(embed_dims[i + 1]) for i in range(3)])
+        self.extra_norms = nn.ModuleList()
+        for i in range(3):
+            self.extra_norms.append(nn.LayerNorm(embed_dims[i + 1]))
+
         self.apply(self._init_weights)
+
+        self.register_buffer("rgb_mean", torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1))
+        self.register_buffer("rgb_std", torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1))
 
     def _init_weights(self, m):
         if isinstance(m, nn.Linear):
             trunc_normal_(m.weight, std=0.02)
-            if m.bias is not None: nn.init.constant_(m.bias, 0)
-        elif isinstance(m, (nn.LayerNorm, nn.BatchNorm2d, nn.SyncBatchNorm)):
-            if m.bias is not None: nn.init.constant_(m.bias, 0)
-            if m.weight is not None: nn.init.constant_(m.weight, 1.0)
+            if isinstance(m, nn.Linear) and m.bias is not None:
+                nn.init.constant_(m.bias, 0)
+        elif isinstance(m, nn.LayerNorm):
+            try:
+                nn.init.constant_(m.bias, 0)
+                nn.init.constant_(m.weight, 1.0)
+            except:
+                pass
 
-    def load_pretrained(self, checkpoint_path):
-        """
-        加载预训练权重
-        """
-        logger.info(f"📥 Loading DFormer weights from: {Colors.UNDERLINE}{Colors.CYAN}{checkpoint_path}{Colors.RESET}")
-        
-        try:
-            checkpoint = torch.load(checkpoint_path, map_location="cpu")
-        except FileNotFoundError:
-            logger.error(f"❌ {Colors.BRIGHT_RED}Checkpoint not found:{Colors.RESET} {Colors.UNDERLINE}{Colors.CYAN}{checkpoint_path}{Colors.RESET}")
-            return
-        
-        # 兼容不同的保存格式
-        if "model" in checkpoint: state_dict = checkpoint["model"]
-        elif "state_dict" in checkpoint: state_dict = checkpoint["state_dict"]
-        else: state_dict = checkpoint
+    def init_weights(self, pretrained=None):
+        """Initialize the weights in backbone.
 
-        # 清洗 Key (去除 backbone. 前缀)
-        new_state_dict = OrderedDict()
-        for k, v in state_dict.items():
-            if k.startswith("backbone."):
-                new_state_dict[k[9:]] = v
-            elif not k.startswith(("decode_head", "aux_head")): # 忽略分割头
-                new_state_dict[k] = v
-        
-        missing, unexpected = self.load_state_dict(new_state_dict, strict=False)
-        if len(missing) > 0:
-            logger.warning(f"⚠️ Missing keys (safe to ignore if head/norm): {missing[:3]} ...")
+        Args:
+            pretrained (str, optional): Path to pre-trained weights.
+                Defaults to None.
+        """
+
+        def _init_weights(m):
+            if isinstance(m, nn.Linear):
+                trunc_normal_(m.weight, std=0.02)
+                if isinstance(m, nn.Linear) and m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+            elif isinstance(m, nn.LayerNorm):
+                nn.init.constant_(m.bias, 0)
+                nn.init.constant_(m.weight, 1.0)
+
+        if isinstance(pretrained, str):
+            self.apply(_init_weights)
+            # logger = get_root_logger()
+            _state_dict = torch.load(pretrained)
+            if "model" in _state_dict.keys():
+                _state_dict = _state_dict["model"]
+            if "state_dict" in _state_dict.keys():
+                _state_dict = _state_dict["state_dict"]
+            state_dict = OrderedDict()
+
+            for k, v in _state_dict.items():
+                if k.startswith("backbone."):
+                    state_dict[k[9:]] = v
+                else:
+                    state_dict[k] = v
+            print("load " + pretrained)
+            load_state_dict(self, state_dict, strict=False)
+            # load_checkpoint(self, pretrained, strict=False)
+            # load_checkpoint(self, pretrained, strict=False, logger=logger)
+        elif pretrained is None:
+            self.apply(_init_weights)
+        else:
+            raise TypeError("pretrained must be a str or None")
+
+    @torch.jit.ignore
+    def no_weight_decay(self):
+        return {"absolute_pos_embed"}
+
+    @torch.jit.ignore
+    def no_weight_decay_keywords(self):
+        return {"relative_position_bias_table"}
 
     def forward(self, x, x_e):
-        # x: RGB [B, 3, H, W]
-        # x_e: Depth [B, 1, H, W] (Or [B, C, H, W] where we take 0th channel)
+        # # === DEBUG: 归一化前的原始状态 ===
+        # with torch.no_grad():
+        #     print(f"\n{'='*20} Normalization Debug {'='*20}")
+        #     print(f"[Before] RGB x   | Shape: {list(x.shape)} | Mean: {x.mean():.4f} | Std: {x.std():.4f}")
+        #     print(f"[Before] Depth xe | Shape: {list(x_e.shape)} | Mean: {x_e.mean():.4f} | Std: {x_e.std():.4f}")
+        # normalize
+        x = (x - self.rgb_mean) / self.rgb_std
+        x_e = (x_e - self.rgb_mean) / self.rgb_std
         
+        # # === DEBUG: 检查最终进入网络的 xe 形状 ===
+        # with torch.no_grad():
+        #     print(f"[After]  RGB x   | Mean: {x.mean():.4f} | Std: {x.std():.4f}")
+        #     print(f"[After]  Depth xe| Mean: {x_e.mean():.4f} | Std: {x_e.std():.4f}")
+        #     print(f"[Final]  xe layer input | Shape: {list(x_e.shape)}")
+        #     if x_e.shape[1] != 1:
+        #         print(f"⚠️ Warning: x_e channel count is {x_e.shape[1]}, expected 1!")
+        #     print(f"{'='*50}\n")
+        # # === DEBUG 结束 ===
+        # rgb input
         x = self.patch_embed(x)
-        # Ensure depth is [B, 1, H, W]
-        if x_e.dim() == 4 and x_e.shape[1] > 1:
-            x_e = x_e[:, 0:1, :, :] # Keep dimension 1
-        elif x_e.dim() == 3:
-            x_e = x_e.unsqueeze(1)
-            
+        # depth input
+        x_e = x_e[:, 0, :, :].unsqueeze(1)
+
         outs = []
-        for i, layer in enumerate(self.layers):
+
+        for i in range(self.num_layers):
+            layer = self.layers[i]
             x_out, x = layer(x, x_e)
             if i in self.out_indices:
-                if i != 0: x_out = self.extra_norms[i - 1](x_out)
-                outs.append(x_out.permute(0, 3, 1, 2).contiguous())
-        
-        return tuple(outs) # Tuple of [B, C, H/scale, W/scale]
+                if i != 0:
+                    x_out = self.extra_norms[i - 1](x_out)
+                out = x_out.permute(0, 3, 1, 2).contiguous()
+                outs.append(out)
+
+        return tuple(outs)
+
+    def train(self, mode=True):
+        """Convert the model into training mode while keep normalization layer
+        freezed."""
+        super().train(mode)
+        if mode and self.norm_eval:
+            for m in self.modules():
+                # trick: eval have effect on BatchNorm only
+                if isinstance(m, nn.BatchNorm2d):
+                    m.eval()
 
 
 def DFormerv2_S(pretrained=False, **kwargs):
-    model = DFormerv2(
+    model = dformerv2(
         embed_dims=[64, 128, 256, 512],
         depths=[3, 4, 18, 4],
         num_heads=[4, 4, 8, 16],
@@ -602,7 +680,7 @@ def DFormerv2_S(pretrained=False, **kwargs):
 
 
 def DFormerv2_B(pretrained=False, **kwargs):
-    model = DFormerv2(
+    model = dformerv2(
         embed_dims=[80, 160, 320, 512],
         depths=[4, 8, 25, 8],
         num_heads=[5, 5, 10, 16],
@@ -615,7 +693,7 @@ def DFormerv2_B(pretrained=False, **kwargs):
 
 
 def DFormerv2_L(pretrained=False, **kwargs):
-    model = DFormerv2(
+    model = dformerv2(
         embed_dims=[112, 224, 448, 640],
         depths=[4, 8, 25, 8],
         num_heads=[7, 7, 14, 20],

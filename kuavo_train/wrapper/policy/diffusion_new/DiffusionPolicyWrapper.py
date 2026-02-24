@@ -110,7 +110,7 @@ class CustomDiffusionPolicyWrapper(DiffusionPolicy):
             # for key in self.config.depth_features:
             #     batch[key] = resize_image(batch[key],target_size=self.config.resize_shape, image_type="depth")
             batch[OBS_DEPTH] = torch.stack([batch[key] for key in self.config.depth_features], dim=-4)
-            batch[OBS_DEPTH] = batch[OBS_DEPTH].mean(dim=-3, keepdim=True)  # if multiple channels depth images, average them
+            #batch[OBS_DEPTH] = batch[OBS_DEPTH].mean(dim=-3, keepdim=True)  # if multiple channels depth images, average them
 
 
         # NOTE: It's important that this happens after stacking the images into a single key.
@@ -255,7 +255,7 @@ class CustomDiffusionPolicyWrapper(DiffusionPolicy):
         if self.config.use_depth and self.config.depth_features:
             batch = dict(batch)  # shallow copy so that adding a key doesn't modify the original
             batch[OBS_DEPTH] = torch.stack([batch[key] for key in self.config.depth_features], dim=-4)
-            batch[OBS_DEPTH] = batch[OBS_DEPTH].mean(dim=-3, keepdim=True)  # if multiple channels depth images, average them
+            #batch[OBS_DEPTH] = batch[OBS_DEPTH].mean(dim=-3, keepdim=True)  # if multiple channels depth images, average them
             # print("mean depth:",batch[OBS_DEPTH].mean().item(),"max depth:",batch[OBS_DEPTH].max().item(),"min depth:",batch[OBS_DEPTH].min().item())
         # batch = self.normalize_targets(batch)
         # print(batch[OBS_DEPTH].shape, batch[OBS_DEPTH].max(), batch[OBS_DEPTH].min())

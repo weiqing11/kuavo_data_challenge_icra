@@ -1,3 +1,6 @@
+# =========================================================
+# 1. Hydra 运行路径与基础配置
+# =========================================================
 hydra:  # Hydra config directory, for parameter checking only
   run:
     dir: ./outputs/train_hydra_save/singlerun/${now:%Y%m%d_%H%M%S}  # Single run root dir
@@ -5,30 +8,30 @@ hydra:  # Hydra config directory, for parameter checking only
     dir: ./outputs/train_hydra_save/multirun/${now:%Y%m%d_%H%M%S}  # sweep root dir
     subdir: ${hydra:job.override_dirname}
 
-
-task: "Task1"  # Custom task name. If using huggingface datasets instead of local dataset, please specify, such as pusht, aloha_sim_insertion_human etc.
-method: "siglip_patches_lora_AdaLN"  # Custom method name
+task: "Task1"  # Custom task name. If using huggingface datasets instead of local dataset...
+method: "siglip_DFormer_S_train"  # Custom method name
 timestamp: ${now:%Y%m%d_%H%M%S}  # Auto-obtained timestamp
-# 训练时模型参数的保存目录在outputs/train/<task>/<method>/<timestamp>中
-repoid: "lerobot/${task}"  # Newer versions of lerobot require this, for lerobot reference only. Not actually used elsewhere.
+repoid: "lerobot/${task}"  # Newer versions of lerobot require this, for lerobot reference only.
 root: "/home/liangweiqing/data/code/kuavo_data_challenge_icra/datasets/Task1"  # Locally converted lerobot dataset directory
 # root: null  # If using huggingface datasets instead of local dataset, please specify in task, such as pusht, aloha_sim_insertion_human.
 # Uncomment and leave that to null in that case. This will then use their cloud downloads
 
-# Training Configurations
+
+# ===========================================================
+# 2. 训练超参数 (Training Configurations)
+# ===========================================================
 training:
     output_directory: "outputs/train/${task}/${method}"  # Training parameters default output path. Do not modify this structure
     seed: 42  # Data augmentation and training seed. Used for easier result reproduction
     max_epoch: 500  # Max trainign epoch, used to control learning rate controller. Related to max_training_step beneath
-    
-    save_freq_epoch: 5  # Training parameter save frequency. 10 epoch per saved weights
+    save_freq_epoch: 10  # Training parameter save frequency. 10 epoch per saved weights
     log_freq: 1  # Progress bar refresh frequency. 1 = Every iteration step.
     device: "cuda" # Training device. Single GPU only by default. Systems with multiple GPU's please use CUDA_VISIBLE_DEVICES=6 as an envionment variable. cuda:6 might not work.
-    accumulation_steps: 4  # Grad accumulation step
+    accumulation_steps: 8  # Grad accumulation step
     ema_power: 0.75  # This parameter can be used if the EMA (Equation of Mobility) moving exponential average method is employed.
     # However, current testing shows that using EMA causes performance degradation, so it is no longer supported in the code.
-
-    batch_size: 8  # Batch size. Adjust as needed.
+    
+    batch_size: 4  # Batch size. Adjust as needed.
     num_workers: 8  # dataloader's num_workers. Adjust as needed per your computer's performance. Setting it too high might lock up your computer
     drop_last: False  # Whether to drop the last incomplete batch
 
@@ -38,7 +41,7 @@ training:
 
     # resume training
     resume: false
-    resume_timestamp: "run_20251120_164240"  # If enabled, it will pull the last epoch from outputs/train/<task>/<method>/<resume_timestamp> to continue training
+    resume_timestamp: "run_20260211_150636"  # If enabled, it will pull the last epoch from outputs/train/<task>/<method>/<resume_timestamp> to continue training
 
     # Data augmentation related config
     RGB_Augmenter:
@@ -46,53 +49,21 @@ training:
       max_num_transforms: 1
       random_order: True
       tfs:
-        notransform:
-          weight: 3.0  # Weight
-          type: "Identity"
-          kwargs: {}
-        brightness:
-          weight: 1.0
-          type: "ColorJitter"
-          kwargs: {"brightness": [0.5, 1.5]}
-        contrast:
-          weight: 1.0
-          type: "ColorJitter"
-          kwargs: {"contrast": [0.5, 1.5]}
-        saturation:
-          weight: 1.0
-          type: "ColorJitter"
-          kwargs: {"saturation": [0.5, 1.5]}
-        hue:
-          weight: 1.0
-          type: "ColorJitter"
-          kwargs: {"hue": [-0.05, 0.05]}
-        sharpness:
-          weight: 1.0
-          type: "SharpnessJitter"
-          kwargs: {"sharpness": [0.5, 1.5]}
-        random_mask:
-          weight: 1.0
-          type: RandomMask
-          kwargs:
-            mask_size: [0.15, 0.15]   # h_ratio, w_ratio
-        random_border_cutout:
-          weight: 1.0
-          type: RandomBorderCutout
-          kwargs:
-            cut_ratio: 0.15
-        gaussian_noise:
-          weight: 1.0
-          type: GaussianNoise
-          kwargs:
-            mean: 0.0
-            std: 0.1
-        gamma_correction:
-          weight: 1.0
-          type: GammaCorrection
-          kwargs:
-            gamma: [0.5, 2.0]
-        
+        notransform: { weight: 3.0, type: "Identity", kwargs: {} }
+        brightness:  { weight: 1.0, type: "ColorJitter", kwargs: {"brightness": [0.5, 1.5]} }
+        contrast:    { weight: 1.0, type: "ColorJitter", kwargs: {"contrast": [0.5, 1.5]} }
+        saturation:  { weight: 1.0, type: "ColorJitter", kwargs: {"saturation": [0.5, 1.5]} }
+        hue:         { weight: 1.0, type: "ColorJitter", kwargs: {"hue": [-0.05, 0.05]} }
+        sharpness:   { weight: 1.0, type: "SharpnessJitter", kwargs: {"sharpness": [0.5, 1.5]} }
+        random_mask: { weight: 1.0, type: "RandomMask", kwargs: {"mask_size": [0.15, 0.15]} }
+        random_border_cutout: { weight: 1.0, type: "RandomBorderCutout", kwargs: {"cut_ratio": 0.15} }
+        gaussian_noise: { weight: 1.0, type: "GaussianNoise", kwargs: {"mean": 0.0, "std": 0.1} }
+        gamma_correction: { weight: 1.0, type: "GammaCorrection", kwargs: {"gamma": [0.5, 2.0]} }
 
+
+# =========================================================
+# 3. 策略核心参数 (Policy Configurations)
+# =========================================================
 policy_name: diffusion  # Policy type. Supports diffusion and act
 
 policy:
@@ -102,47 +73,24 @@ policy:
     n_action_steps: 8
     drop_n_last_frames: 7  # Drop the last n frames
 
+    vision_backbone: "siglip_dformer" #"siglip_only"
+
     normalization_mapping: # RGB is equivalent to VISUAL type. diffusion also supports depth data. These two parameters are used to set the normalization method.
-      RGB: 
-        _target_: lerobot.configs.types.NormalizationMode
-        value: IDENTITY
-      DEPTH: 
-        _target_: lerobot.configs.types.NormalizationMode
-        value: MIN_MAX
+      VISUAL: { _target_: lerobot.configs.types.NormalizationMode, value: IDENTITY }
+      RGB: { _target_: lerobot.configs.types.NormalizationMode, value: IDENTITY }
+      DEPTH: { _target_: lerobot.configs.types.NormalizationMode, value: IDENTITY }
 
     # Image cropping. Not supported in lerobot built-in policies
     crop_is_random: True
     crop_shape: [420, 560]  #  [84, 84] [420, 742]
 
     use_amp: False  # Mixed precision training
-
-    # Model hyperparameters adjustments
-    # vision_backbone: resnet18
-    vision_backbone: "siglip_only" #"dinov2+siglip" 
-    vision_backbone_rgbd: "DFormerv2_small"
-
-    dinov2_model_name: "facebook/dinov2-small"
-    siglip_model_name: "google/siglip2-base-patch16-224"
-    DFormer_path: "/home/liangweiqing/data/models/DFormerv2_pretrained/DFormerv2/pretrained/DFormerv2_Small_pretrained.pth"
-
-    vision_encoder_mode: patches #spatial #global
-    # === LoRA 配置 ===
-    use_lora: True          # 开启 LoRA
-    lora_rank: 16            # 推荐 8 或 16
-    lora_alpha: 32           # 推荐 rank * 2
-    vision_freeze: False  # 是否冻结模型参数
-    vision_fusion_dim: 256
-    vision_attn_heads: 8
     spatial_softmax_num_keypoints: 64
     use_separate_rgb_encoder_per_camera: False
 
-    down_dims:
-    - 512
-    - 1024
-    - 2048
+    down_dims: [512, 1024, 2048]
     kernel_size: 5
     n_groups: 8
-
     # If using UNet, the following two lines can be adjusted. See the `use_unet` setting in `custom` for details.
     diffusion_step_embed_dim: 128
     use_film_scale_modulation: true
@@ -161,38 +109,56 @@ policy:
 
     # optimizer and scheduler
     optimizer_lr: 0.0001
-    optimizer_betas:
-    - 0.95
-    - 0.999
+    optimizer_betas: [0.95, 0.999]
     optimizer_eps: 1.0e-08
     optimizer_weight_decay: 1.0e-03
     scheduler_name: cosine
     scheduler_warmup_steps: 500
 
+    # =========================================================
+    # 4. 自定义策略扩展 (Custom Extensions)
+    # =========================================================
     custom:  # Custom configs. Special adjustments based on the lerobot diffusion policy, including depth support. You may refer to related codes for details
       # support depth image
-      use_depth: false #false
-      depth_encoder_type: "DEPTH" #"RGBD"
+      use_depth: true #false
       depth_backbone: resnet18
       use_separate_depth_encoder_per_camera: False
 
       # resize and augmentation
-      resize_shape: [192, 256] #[224, 224] #[210, 280]  # [224, 368]
+      resize_shape: [224, 224] #[192, 256] # #[210, 280]  # [224, 368]
 
       # state encoder.
       use_state_encoder: true
       state_feature_dim: 128
 
-      # Unet
+      # model selection (Only one should be True)
       use_unet: False
-      # transformer
       use_transformer: False
       use_dit: True
+
       transformer_n_emb: 384
       transformer_n_head: 8
       transformer_n_layer: 12
       transformer_dropout: 0.1
+      ddim_eta: 0.1 # eta for ddim
 
-      # eta for ddim
-      ddim_eta: 0.1
-      state_fuse: False  # Whether to use state fusion modules
+      # === Perceiver Resampler 配置 ===
+      use_perceiver: False          # 开启 Token 压缩
+      perceiver_num_queries: 256   # 压缩后的 Token 数量 (建议 32-64)
+      perceiver_depth: 2           # Resampler 的层数 (通常 1 或 2 足够)
+
+      # === 视觉模型名称与路径 ===
+      vision_backbone_rgbd: "DFormerv2_small"
+      dino_model_name: "dinov3/facebook:dinov3-vitb16-pretrain-lvd1689m"
+      siglip_model_name: "google/siglip2-base-patch16-224"
+      DFormer_path: "/home/liangweiqing/data/models/DFormerv2_pretrained/DFormerv2/pretrained/DFormerv2_Small_pretrained.pth"
+      vision_encoder_mode: patches 
+      
+      # === LoRA 配置 ===
+      use_lora: True          # 开启 LoRA
+      lora_rank: 16            # 推荐 8 或 16
+      lora_alpha: 32           # 推荐 rank * 2
+      lora_dropout: 0.05
+      vision_freeze: False  # 是否冻结模型参数
+      vision_fusion_dim: 256
+      vision_attn_heads: 8
