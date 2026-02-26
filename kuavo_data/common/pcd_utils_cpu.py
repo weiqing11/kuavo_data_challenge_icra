@@ -1,4 +1,4 @@
-# 26.2.5.11
+# 26.2.24
 import open3d as o3d
 import numpy as np
 import warnings
@@ -69,8 +69,8 @@ def clean_point_cloud(pcd, task_id, camera_id, max_dist, remove_outliers):
         warnings.warn("Point cloud has no points.")
         return pcd
 
-    if task_id == 1:
-        # 任务1：保留以 (0,0,0) 为球心，半径为 max_dist 的球内点
+    if task_id in [1, 2]:
+        # 任务1/2：保留以 (0,0,0) 为球心，半径为 max_dist 的球内点
         if max_dist is None:
             if camera_id == 'cam_h':
                 max_dist = 0.7
@@ -82,7 +82,19 @@ def clean_point_cloud(pcd, task_id, camera_id, max_dist, remove_outliers):
         dist_sq = np.sum(points**2, axis=1)
         mask = dist_sq <= (max_dist ** 2)
         pcd = pcd.select_by_index(np.where(mask)[0])
-        
+    elif task_id == 3:
+        # 任务3：保留以 (0,0,0) 为球心，半径为 max_dist 的球内点
+        if max_dist is None:
+            if camera_id == 'cam_h':
+                max_dist = 0.7
+            elif camera_id in ['cam_l', 'cam_r']:
+                max_dist = 0.4
+            else:
+                raise ValueError(f"Unknown camera ID: {camera_id}")
+        points = np.asarray(pcd.points)
+        dist_sq = np.sum(points**2, axis=1)
+        mask = dist_sq <= (max_dist ** 2)
+        pcd = pcd.select_by_index(np.where(mask)[0])
     else:
         warnings.warn(f"未知任务ID {task_id}，未执行点云清洗。")
 
@@ -242,8 +254,8 @@ def convert_numpy_to_o3d(np_pcd):
     
     return pcd
 
-# 任务1 点云处理流水线
-def process_pcd_task1(rgb_img, depth_img, camera_id, method, target_points=4096, fov_deg=60.0):
+# 点云处理流水线
+def process_pcd_task(rgb_img, depth_img, camera_id, task_id=1, method='fps', target_points=4096, fov_deg=60.0):
     # 修改图像大小为原来1/2
     rgb_img, depth_img = resize_images(rgb_img, depth_img, rgb_img.shape[1]//2, rgb_img.shape[0]//2)
     # fov_deg: 水平视场角，默认为 60 度
@@ -264,7 +276,7 @@ def process_pcd_task1(rgb_img, depth_img, camera_id, method, target_points=4096,
                                depth_scale=1000.0)
     # 清洗点云
     pcd = clean_point_cloud(pcd=pcd, 
-                            task_id=1, 
+                            task_id=task_id, 
                             camera_id=camera_id,
                             max_dist=None,
                             remove_outliers=True)

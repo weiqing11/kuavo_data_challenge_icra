@@ -70,11 +70,11 @@ class ObsBuffer:
             '/leju_claw_state': self.lejuClawState_callback,
             '/gripper/state': self.rq2f85State_callback,
         }
-        self.setup_subscribers()
-
-        # 新增的原始帧存储，保证能生成高质量点云(只存储头部相机信息)
+        # 新增的原始帧存储
         self.raw_rgb_frames = {}
         self.raw_depth_frames = {}
+        
+        self.setup_subscribers()
 
     # ===== ROS订阅 Subscription =====
     def create_callback(self, callback, topic_key, handle):

@@ -93,12 +93,13 @@ inference:
   start_seed: 42  # Initial seed for each episode
   device: "cuda"  # or "cpu"
   task: "idp3_3v_rgb"  # Task name - should match your training task
-  method: "idp3"  # Method name - IDP3 policy
+  method: "1024_3"  # Method name - IDP3 policy
   timestamp: "run_20260209_225505"  # Training timestamp - Update this to your actual training run timestamp
-  epoch: 20  # Which epoch to use from the training weights. I.e. 50, 100, best, etc. Note:Weights will be used from outputs/train/<task>/<method>/<timestamp>/epoch<epoch> to load policy
+  epoch: 60  # Which epoch to use from the training weights. I.e. 50, 100, best, etc. Note:Weights will be used from outputs/train/<task>/<method>/<timestamp>/epoch<epoch> to load policy
   max_episode_steps: 200  # Max episode steps. Stops after this threshold. Increase for longer tasks.
 
-  # 新增点云配置选项
+# 新增点云配置选项，决定环境侧会给出什么点云
+# 目前num_points和channels固定在代码里面了，需要更改
   need_point_cloud: true
   point_cloud_num_points: 4096
   point_cloud_channels: 6

@@ -15,7 +15,7 @@ ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT_DIR not in sys.path:
     sys.path.insert(0, ROOT_DIR)
 import kuavo_data.common.kuavo_dataset as kuavo
-from kuavo_data.common.pcd_utils_cpu import process_pcd_task1
+from kuavo_data.common.pcd_utils_cpu import process_pcd_task
 
 logging.basicConfig(
     level="DEBUG",
@@ -405,7 +405,7 @@ def populate_dataset(
                     raise ValueError(f"Unknown camera: {cam}")
                 rgb_img = imgs_per_cam[rgb_key][i]
                 depth_img = imgs_per_cam[depth_key][i]
-                pcd_points = process_pcd_task1(rgb_img, depth_img, f"cam_{cam}", 'fps')
+                pcd_points = process_pcd_task(rgb_img, depth_img, f"cam_{cam}", task_id=2)
                 frame[f"observation.pc_{cam}"] = pcd_points
 
             for idx, (camera, img_array) in enumerate(imgs_per_cam.items()):

@@ -550,6 +550,7 @@ class KuavoBaseRosEnv(gym.Env):
                     method=self.point_cloud_method,
                     target_points=self.point_cloud_num_points
                 )
+                '''保持和训练一致，环境给原始大小，截断由模型自行处理
                 # 将生成的点云调整为config中指定的大小
                 target_points = self.point_cloud_num_points
                 target_channels = self.point_cloud_channels
@@ -566,7 +567,7 @@ class KuavoBaseRosEnv(gym.Env):
                 elif cur_channels < target_channels:
                     raise ValueError(f"Point Cloud Error: Not enough channels in the point cloud! Got {cur_channels}, but expected {target_channels}.")
                 obs[out_key] = torch.from_numpy(pcd_array).float().unsqueeze(0)
-        
+                '''
         return obs
 
     def close(self):
