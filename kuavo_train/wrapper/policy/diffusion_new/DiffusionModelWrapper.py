@@ -1,9 +1,10 @@
 # multimodal_diffusion_wrapper.py
-import json
 import math
+import os
 from pathlib import Path
 from PIL import Image
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, Tuple, Callable
+import cv2
 import einops
 import torch
 import torch.nn as nn
@@ -14,7 +15,7 @@ import torch.nn.functional as F
 from transformers import AutoModel, AutoImageProcessor, SiglipVisionModel, SiglipImageProcessor
 from kuavo_train.logger import logger, log_box, Colors
 
-from lerobot.utils.constants import OBS_ENV_STATE, OBS_IMAGES, OBS_STATE, ACTION
+from lerobot.utils.constants import OBS_ENV_STATE, OBS_IMAGES, OBS_STATE
 from kuavo_train.wrapper.policy.diffusion_new.DiffusionConfigWrapper import CustomDiffusionConfigWrapper
 from lerobot.policies.utils import get_device_from_parameters, get_dtype_from_parameters, get_output_shape
 from lerobot.policies.diffusion.modeling_diffusion import (
@@ -50,6 +51,93 @@ def _make_noise_scheduler_factory(name: str, **kwargs: Dict[str, Any]):
         return DDIMScheduler(**kwargs)
     else:
         raise ValueError(f"Unsupported noise scheduler type {name}")
+
+
+# =====================================================================
+# 1. 官方 ToMe 核心算子 (保持不变)
+# =====================================================================
+def do_nothing(x, mode=None):
+    return x
+
+def bipartite_soft_matching(metric: torch.Tensor, r: int) -> Tuple[Callable, Callable]:
+    """官方二分软匹配核心算法"""
+    t = metric.shape[1]
+    # 严格遵守官方的 50% 限制
+    r = min(r, t // 2) 
+
+    if r <= 0:
+        return do_nothing, do_nothing
+
+    with torch.no_grad():
+        metric = metric / metric.norm(dim=-1, keepdim=True)
+        a, b = metric[..., ::2, :], metric[..., 1::2, :]
+        scores = a @ b.transpose(-1, -2)
+
+        node_max, node_idx = scores.max(dim=-1)
+        edge_idx = node_max.argsort(dim=-1, descending=True)[..., None]
+
+        unm_idx = edge_idx[..., r:, :]  # 未融合的 Token
+        src_idx = edge_idx[..., :r, :]  # 将被融合的 Token
+        dst_idx = node_idx[..., None].gather(dim=-2, index=src_idx)
+
+    def merge(x: torch.Tensor, mode="mean") -> torch.Tensor:
+        src, dst = x[..., ::2, :], x[..., 1::2, :]
+        n, t1, c = src.shape
+        unm = src.gather(dim=-2, index=unm_idx.expand(n, t1 - r, c))
+        src = src.gather(dim=-2, index=src_idx.expand(n, r, c))
+        
+        # 使用官方的高效规约算子 (要求 PyTorch >= 1.12)
+        dst = dst.scatter_reduce(-2, dst_idx.expand(n, r, c), src, reduce=mode, include_self=True)
+
+        return torch.cat([unm, dst], dim=1)
+
+    return merge
+
+def merge_wavg(merge: Callable, x: torch.Tensor, size: torch.Tensor = None) -> Tuple[torch.Tensor, torch.Tensor]:
+    """官方的加权平均融合"""
+    if size is None:
+        size = torch.ones_like(x[..., 0, None])
+    x = merge(x * size, mode="sum")
+    size = merge(size, mode="sum")
+    x = x / size
+    return x, size
+
+
+def get_1d_sincos_pos_embed_from_grid(embed_dim, pos):
+    """生成 1D 的 Sine-Cosine 位置编码"""
+    assert embed_dim % 2 == 0
+    omega = torch.arange(embed_dim // 2, dtype=torch.float32)
+    omega /= (embed_dim / 2.)
+    omega = 1. / 10000**omega  # (D/2,)
+
+    pos = pos.reshape(-1)  # (M,)
+    out = torch.einsum('m,d->md', pos, omega)  # 外积: (M, D/2)
+
+    emb_sin = torch.sin(out) # (M, D/2)
+    emb_cos = torch.cos(out) # (M, D/2)
+    return torch.cat([emb_sin, emb_cos], dim=1)  # (M, D)
+
+def get_2d_sincos_pos_embed(embed_dim, grid_size_h, grid_size_w):
+    """
+    生成标准的 2D Sine-Cosine 位置编码
+    返回 shape: (1, H*W, D)
+    """
+    grid_h = torch.arange(grid_size_h, dtype=torch.float32)
+    grid_w = torch.arange(grid_size_w, dtype=torch.float32)
+    
+    # 维度对半开：一半给 H，一半给 W
+    emb_h = get_1d_sincos_pos_embed_from_grid(embed_dim // 2, grid_h)  # (H, D/2)
+    emb_w = get_1d_sincos_pos_embed_from_grid(embed_dim // 2, grid_w)  # (W, D/2)
+    
+    # 扩展到 2D 网格维度
+    emb_h = emb_h.unsqueeze(1).expand(-1, grid_size_w, -1) # (H, W, D/2)
+    emb_w = emb_w.unsqueeze(0).expand(grid_size_h, -1, -1) # (H, W, D/2)
+    
+    # 拼接 H 和 W 的特征
+    pos_embed = torch.cat([emb_h, emb_w], dim=-1) # (H, W, D)
+    pos_embed = pos_embed.reshape(grid_size_h * grid_size_w, embed_dim) # (H*W, D)
+    
+    return pos_embed.unsqueeze(0) # (1, H*W, D)
 
 
 # === Definitions for MLP Projection Module, with Signature :: [..., in_dim] --> [..., out_dim] ===
@@ -635,25 +723,19 @@ class SiglipDFormerEncoder(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.config = config
-        self.debug_image_stats = getattr(config, "debug_image_stats", True)
+        
         # 1. 加载 SigLIP
         siglip_is_local = "/" in config.siglip_model_name
         self.siglip = SiglipVisionModel.from_pretrained(
             config.siglip_model_name,
             local_files_only=siglip_is_local
         )
-        self.siglip_processor = SiglipImageProcessor.from_pretrained(
-            config.siglip_model_name,
-            local_files_only=siglip_is_local
-        )
         
-        # ==================== 修复：新增 LoRA 与冻结逻辑 ====================
+        # ==================== LoRA 与冻结逻辑 ====================
         self.use_lora = getattr(config, "use_lora", False)
-        # 获取全局冻结配置，默认 True (冻结)
         self.vision_freeze = getattr(config, "vision_freeze", True)
         
         if self.use_lora:
-            # logger.info(f"🔧 Applying LoRA to SigLIP Backbone...") # 如果有logger可以解除注释
             peft_config = LoraConfig(
                 r=getattr(config, "lora_rank", 16),
                 lora_alpha=getattr(config, "lora_alpha", 32),
@@ -661,45 +743,35 @@ class SiglipDFormerEncoder(nn.Module):
                 lora_dropout=getattr(config, "lora_dropout", 0.05),
                 bias="none",
             )
-            # get_peft_model 会自动冻结 SigLIP 的主干参数，只允许 LoRA 层求导
             self.siglip = get_peft_model(self.siglip, peft_config)
             
         elif self.vision_freeze:
-            # 如果不使用 LoRA 且开启了冻结，则强行冻结 SigLIP 全参
             for param in self.siglip.parameters():
                 param.requires_grad = False
             self.siglip.eval()
-        # ===================================================================
+        # =========================================================
         
-        # 默认采样 DFormer Stage1/2/3，可通过 config.siglip_dformer_stages 覆盖
-        self.dformer_stage_indices = getattr(
-            config, "siglip_dformer_stages", (0, 1, 2)
-        )
-
-        # 2. 加载 DFormer (其内部已经根据 config.vision_freeze 做了冻结判断)
+        # 2. 加载 DFormer
         self.dformer_backbone = DFomerRGBDBackbone(config)
         
         # 3. 维度配置
-        self.feature_dim = getattr(config, "transformer_n_emb", 384)
+        target_dim = getattr(config, "transformer_n_emb", 384)
+        self.feature_dim = target_dim
         self.siglip_dim = self.siglip.config.hidden_size
         self.dformer_stage_idx = 2 # 使用 Stage 3 特征 (H/16, W/16)
+        
+        dformer_channels = self.dformer_backbone.get_out_channels()
+        self.dformer_dim = dformer_channels[self.dformer_stage_idx]
 
         # 4. 投影与融合层
-        self.proj_siglip = nn.Linear(self.siglip_dim, self.feature_dim)
-        self.dformer_proj = nn.ModuleDict({
-            f"stage_{idx}": nn.Linear(
-                self.dformer_backbone.get_out_channels()[idx],
-                self.feature_dim
-            )
-            for idx in self.dformer_stage_indices
-        })
-        self.norm = nn.LayerNorm(self.feature_dim)
+        self.proj_siglip = nn.Linear(self.siglip_dim, target_dim)
+        self.proj_dformer = nn.Linear(self.dformer_dim, target_dim)
+        self.norm = nn.LayerNorm(target_dim)
         
-        fusion_in_dim = self.feature_dim * (1 + len(self.dformer_stage_indices))
         self.fusion_map = nn.Sequential(
-            nn.Linear(fusion_in_dim, fusion_in_dim * 2),
+            nn.Linear(target_dim * 2, target_dim),
             nn.GELU(),
-            nn.Linear(fusion_in_dim * 2, self.feature_dim),
+            nn.Linear(target_dim, target_dim)
         )
 
         # 5. Token 数量预计算
@@ -708,56 +780,155 @@ class SiglipDFormerEncoder(nn.Module):
         self.num_patches_h, self.num_patches_w = h // self.patch_size, w // self.patch_size
         self.num_patches = self.num_patches_h * self.num_patches_w
 
-    def _log_image_stats(self, name: str, tensor: torch.Tensor) -> None:
-        stats = {
-            "min": tensor.detach().amin().item(),
-            "max": tensor.detach().amax().item(),
-            "mean": tensor.detach().mean().item(),
-            "std": tensor.detach().std(unbiased=False).item(),
-        }
-        logger.debug(f"[SiglipDFormerEncoder] {name} stats: {stats}")
+        # 🌟 6. 生成并注册 2D Sine-Cosine 位置编码 (不可学习参数)
+        # 使用 register_buffer 确保它能随模型被发送到 GPU，但不会更新梯度
+        pos_embed = get_2d_sincos_pos_embed(target_dim, self.num_patches_h, self.num_patches_w)
+        self.register_buffer("pos_embed", pos_embed)
+
+        # 7. ToMe 配置
+        self.tome_compress_ratio = getattr(config, "tome_compress_ratio", 2)
+        # 🌟 新增：每次迭代允许合并的最大比例 (默认 5%)
+        self.tome_step_ratio = getattr(config, "tome_step_ratio", 0.05)
+
+        # ============================================================
+        # 🌟 8. 调试与可视化配置
+        # ============================================================
+        self.enable_debug_vis = getattr(config, "enable_debug_vis", True) # 默认开启
+        self.vis_save_freq = 100       # 每 100 步保存一次
+        self.vis_save_dir = "discuss/tome_debug_logs" # 保存目录
+        self._forward_step_count = 0   # 内部步数计数器
+        
+        if self.enable_debug_vis:
+            os.makedirs(self.vis_save_dir, exist_ok=True)
+
+    def _save_tome_visualization(self, rgb_tensor: torch.Tensor, tracker_tensor: torch.Tensor):
+        """内部可视化封装函数，生成左中右三联图"""
+        # 1. 提取并反归一化第一张图像 (假设 rgb_tensor 是 [B, C, H, W])
+        img_t = rgb_tensor[0].detach().cpu().float()
+        
+        # 稳健的反归一化 (Min-Max 到 0-255)，适配各类输入规范
+        img_min, img_max = img_t.min(), img_t.max()
+        img_t = (img_t - img_min) / (img_max - img_min + 1e-5)
+        img_np = (img_t.permute(1, 2, 0).numpy() * 255).astype(np.uint8)
+        orig_h, orig_w = img_np.shape[:2]
+
+        # 2. 提取 Tracker 掩码 [N_final, N_original]
+        tracker = tracker_tensor[0].detach().cpu().numpy()
+        n_final, n_orig = tracker.shape
+        masks = tracker.reshape(n_final, self.num_patches_h, self.num_patches_w)
+
+        # 3. 制作 Token 色块图 (Middle)
+        np.random.seed(42) # 固定种子让同一位置的 Token 颜色在不同步数下相对一致
+        colors = np.random.randint(50, 255, size=(n_final, 3), dtype=np.uint8)
+        mask_img = np.zeros((self.num_patches_h, self.num_patches_w, 3), dtype=np.uint8)
+        
+        for i in range(n_final):
+            y_idx, x_idx = np.where(masks[i] > 0.5) 
+            mask_img[y_idx, x_idx] = colors[i]
+            
+        # 放大掩码图到原图尺寸
+        mask_img_resized = cv2.resize(mask_img, (orig_w, orig_h), interpolation=cv2.INTER_NEAREST)
+
+        # 4. 制作叠加图 (Right)
+        alpha = 0.5
+        overlay = cv2.addWeighted(img_np, 1 - alpha, mask_img_resized, alpha, 0)
+
+        # 5. 绘制左中右三联图并保存
+        fig, axes = plt.subplots(1, 3, figsize=(18, 6))
+        
+        axes[0].imshow(img_np)
+        axes[0].set_title(f"Left: Original RGB\nStep: {self._forward_step_count}")
+        axes[0].axis("off")
+        
+        axes[1].imshow(mask_img_resized)
+        axes[1].set_title(f"Middle: Token Clusters\n({n_orig} -> {n_final} Tokens)")
+        axes[1].axis("off")
+        
+        axes[2].imshow(overlay)
+        axes[2].set_title("Right: Overlay (Check Edges)")
+        axes[2].axis("off")
+        
+        plt.tight_layout()
+        save_path = os.path.join(self.vis_save_dir, f"tome_step_{self._forward_step_count:06d}.jpg")
+        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+        plt.close(fig) # 极其重要：释放内存，防止训练 OOM
 
     def forward(self, rgb: torch.Tensor, depth: torch.Tensor) -> torch.Tensor:
         requires_grad = self.use_lora or (not self.vision_freeze)
         context = torch.enable_grad() if requires_grad else torch.no_grad()
         
         with context:
-            if self.debug_image_stats:
-                self._log_image_stats("RGB Input", rgb)
-            siglip_inputs = self.siglip_processor(
-                images=rgb,
-                do_resize=False,
-                do_rescale=False,
-                return_tensors="pt"
-            )
-            siglip_pixels = siglip_inputs["pixel_values"].to(
-                rgb.device,
-                dtype=next(self.siglip.parameters()).dtype
-            )
-            if self.debug_image_stats:
-                self._log_image_stats("SigLIP Pixel Values", siglip_pixels)
-            siglip_out = self.siglip(siglip_pixels, interpolate_pos_encoding=True)
+            siglip_out = self.siglip(rgb, interpolate_pos_encoding=True)
             sig_hidden = getattr(siglip_out, "last_hidden_state", siglip_out[0])
-        
-        sig_tokens = self.proj_siglip(sig_hidden)
-        
-        # B. DFormer 分支 (RGB-D 几何)
-        df_feats = self.dformer_backbone(rgb, depth)
-        df_tokens = []
-        for idx in self.dformer_stage_indices:
-            feat = df_feats[idx]
-            pooled = F.adaptive_avg_pool2d(
-                feat,
-                (self.num_patches_h, self.num_patches_w)
-            )
-            tokens = pooled.flatten(2).transpose(1, 2)
-            tokens = self.dformer_proj[f"stage_{idx}"](tokens)
-            df_tokens.append(tokens)
-        df_tokens = torch.cat(df_tokens, dim=-1)
+            
+        sig_tokens = self.proj_siglip(sig_hidden) 
 
-        fused_tokens = torch.cat([sig_tokens, df_tokens], dim=-1)
-        fused_tokens = self.fusion_map(fused_tokens)
-        return self.norm(fused_tokens)
+        df_feats = self.dformer_backbone(rgb, depth)
+        df_map = df_feats[self.dformer_stage_idx] 
+
+        if df_map.shape[2:] != (self.num_patches_h, self.num_patches_w):
+            df_map = F.interpolate(df_map, size=(self.num_patches_h, self.num_patches_w), 
+                                 mode='bilinear', align_corners=False)
+        
+        df_tokens = df_map.flatten(2).transpose(1, 2) 
+        df_tokens = self.proj_dformer(df_tokens) 
+
+        # E. 特征拼接与融合
+        combined = torch.cat([sig_tokens, df_tokens], dim=-1) 
+        fused_tokens = self.fusion_map(combined)
+        fused_tokens = self.norm(fused_tokens)
+        
+        # ============================================================
+        # 🌟 关键修改 1：在 ToMe 打乱空间前，注入 2D 绝对位置编码
+        # ============================================================
+        fused_tokens = fused_tokens + self.pos_embed
+
+        # ============================================================
+        # 🌟 关键修改 2：改良版 ToMe (多次小步幅压缩，精准锁定背景)
+        # ============================================================
+        B, N, D = fused_tokens.shape
+
+        tracker = None
+        
+        if self.tome_compress_ratio > 1:
+            target_tokens = N // self.tome_compress_ratio
+            total_r = N - target_tokens
+            
+            token_size = torch.ones((B, N, 1), device=fused_tokens.device, dtype=fused_tokens.dtype)
+            current_N = N
+
+            # 初始化追踪器
+            if self.enable_debug_vis and self.training:
+                tracker = torch.eye(N, device=fused_tokens.device, dtype=fused_tokens.dtype)
+                tracker = tracker.unsqueeze(0).expand(B, -1, -1)
+            
+            while total_r > 0:
+                # 限制每次合并的数量，保护前景特征
+                max_r_this_step = max(1, int(current_N * self.tome_step_ratio))
+                current_r = min(total_r, max_r_this_step, current_N // 2)
+                
+                merge_fn = bipartite_soft_matching(fused_tokens, current_r)
+                
+                # 合并时，特征和位置编码会被一并加权平均，形成准确的中心坐标！
+                fused_tokens, token_size = merge_wavg(merge_fn, fused_tokens, token_size)
+                
+                # 仅在需要可视化时更新 tracker，避免增加不必要的计算图负担
+                if tracker is not None:
+                    tracker = merge_fn(tracker, mode="sum")
+
+                total_r -= current_r
+                current_N -= current_r
+        
+        # ============================================================
+        # 触发可视化保存
+        # ============================================================
+        if self.enable_debug_vis and self.training:
+            self._forward_step_count += 1
+            if self._forward_step_count % self.vis_save_freq == 0 and tracker is not None:
+                # 建议扔进 torch.no_grad 防止干扰显存
+                with torch.no_grad():
+                    self._save_tome_visualization(rgb, tracker)
+        return fused_tokens
 
 
 class ResnetRgbEncoder(nn.Module):
@@ -1091,17 +1262,6 @@ class CustomDiffusionModelWrapper(DiffusionModel):
         )
         self.num_inference_steps = config.num_inference_steps or self.noise_scheduler.config.num_train_timesteps
 
-        self.use_view_scoring = getattr(config, "use_view_scoring", True)
-        self.view_score_temp = getattr(config, "view_score_temperature", 0.5)
-        self.view_score_net = nn.Sequential(
-            nn.Linear(config.transformer_n_emb * 2, config.transformer_n_emb // 4),
-            nn.GELU(),
-            nn.Linear(config.transformer_n_emb // 4, 1),
-        )
-        self.view_score_log_interval = getattr(config, "view_score_log_interval", 100)
-        self.view_score_log_path = Path(getattr(config, "view_score_log_path", "discuss/view_scores.json"))
-        self._view_score_call_count = 0
-
         self._log_model_architecture(vision_seq_len, total_cond_len)
 
     def _log_model_architecture(self, vision_seq_len, total_cond_len):
@@ -1148,7 +1308,43 @@ class CustomDiffusionModelWrapper(DiffusionModel):
         tokens_list = []
 
         # ---------------------------------------------------------------------
-        # 1. Robot State Processing
+        # 1. RGB Features Processing
+        # ---------------------------------------------------------------------
+        if getattr(self.config, "image_features", None):
+            
+            # A. 提取特征
+            if getattr(self.config, "use_separate_rgb_encoder_per_camera", False):
+                # 独立编码器：输入 [N_cam, B*S, C, H, W] -> 输出 list of [B*S, N_patches, D]
+                imgs = einops.rearrange(batch[OBS_IMAGES], "b s n ... -> n (b s) ...")
+                enc_outs = [enc(im) for enc, im in zip(self.rgb_encoder, imgs)]
+                # 拼接所有摄像头的 Patch -> [B*S, N_cam * N_patches, D]
+                vis_tokens = torch.cat(enc_outs, dim=1)
+            else:
+                # 共享编码器：输入 [B*S*N_cam, C, H, W] -> 输出 [B*S*N_cam, N_patches, D]
+                imgs = einops.rearrange(batch[OBS_IMAGES], "b s n ... -> (b s n) ...")
+
+                depths = None
+                if OBS_DEPTH in batch:
+                    depths = batch[OBS_DEPTH] 
+                    depths = einops.rearrange(depths, "b s n c h w -> (b s n) c h w")
+                
+                vis_feats = self.rgb_encoder(imgs, depths)
+                # 重排并拼接 -> [B*S, N_cam * N_patches, D]
+                vis_tokens = einops.rearrange(vis_feats, "(b s n) p d -> (b s) (n p) d", b=B, s=S)
+
+            # B. Perceiver 压缩 (关键步骤)
+            if self.use_perceiver:
+                # Input:  [B*S, Total_Raw_Tokens, D]
+                # Output: [B*S, Num_Queries, D] (例如 64 个)
+                vis_tokens = self.perceiver(vis_tokens)
+                
+            # C. 恢复时间维度
+            # [B*S, N_tokens, D] -> [B, S, N_tokens, D]
+            vis_tokens = einops.rearrange(vis_tokens, "(b s) t d -> b s t d", b=B, s=S)
+            tokens_list.append(vis_tokens)
+
+        # ---------------------------------------------------------------------
+        # 2. Robot State Processing
         # ---------------------------------------------------------------------
         if getattr(self.config, "robot_state_feature", None) is not None:
             state_tensor = batch[OBS_STATE]  # [B, S, state_dim]
@@ -1158,68 +1354,7 @@ class CustomDiffusionModelWrapper(DiffusionModel):
                 state_emb = self.state_encoder(state_tensor)
                 # 增加 Token 维度 -> [B, S, 1, D]
                 state_tokens = state_emb.unsqueeze(2)
-
-        # ---------------------------------------------------------------------
-        # 2. RGB Features Processing
-        # ---------------------------------------------------------------------
-        if getattr(self.config, "image_features", None):
-            
-            # A. 提取特征
-            num_cams = batch[OBS_IMAGES].shape[2]
-            per_view_tokens = []
-
-            if getattr(self.config, "use_separate_rgb_encoder_per_camera", False):
-                imgs = einops.rearrange(batch[OBS_IMAGES], "b s n ... -> n (b s) ...")
-                enc_outs = [enc(im) for enc, im in zip(self.rgb_encoder, imgs)]
-                per_view_tokens = enc_outs  # list of [B*S, N_patch, D]
-            else:
-                imgs = einops.rearrange(batch[OBS_IMAGES], "b s n ... -> (b s n) ...")
-                depths = None
-                if OBS_DEPTH in batch:
-                    depths = einops.rearrange(batch[OBS_DEPTH], "b s n c h w -> (b s n) c h w")
-                vis_feats = self.rgb_encoder(imgs, depths)  # (B*S*N_cam, N_patch, D)
-                vis_feats = einops.rearrange(
-                    vis_feats, "(b s n) p d -> (b s) n p d", b=B, s=S, n=num_cams
-                )
-                per_view_tokens = [vis_feats[:, i] for i in range(num_cams)]
-
-            if self.use_view_scoring and len(per_view_tokens) > 1:
-                # [B*S, N_cam, D]
-                view_stats = torch.stack([t.mean(dim=1) for t in per_view_tokens], dim=1)
-                if state_emb is not None:
-                    # state_emb: [B, S, D_state] -> [B*S, D_state]
-                    state_emb_flat = einops.rearrange(state_emb, "b s d -> (b s) d")
-                    # 扩展到所有摄像头视角: [B*S, N_cam, D_state]
-                    state_emb_expanded = state_emb_flat.unsqueeze(1).expand(-1, num_cams, -1)
-                    
-                    # 拼接输入: [B*S, N_cam, D_vis + D_state]
-                    score_input = torch.cat([view_stats, state_emb_expanded], dim=-1)
-                else:
-                    score_input = view_stats
-                # 计算 Logits
-                logits = self.view_score_net(score_input).squeeze(-1)
-                # 计算注意力权重
-                weights = torch.sigmoid(logits / self.view_score_temp)
-                self._last_view_weights = weights
-                self._maybe_log_view_scores(weights)
-                
-                weighted_tokens = []
-                for idx, tokens in enumerate(per_view_tokens):
-                    w = weights[:, idx].unsqueeze(-1).unsqueeze(-1)
-                    weighted_tokens.append(tokens * w)
-                vis_tokens = torch.cat(weighted_tokens, dim=1)
-            else:
-                vis_tokens = torch.cat(per_view_tokens, dim=1)
-
-            if self.use_perceiver:
-                vis_tokens = self.perceiver(vis_tokens)
-                
-            # C. 恢复时间维度
-            # [B*S, N_tokens, D] -> [B, S, N_tokens, D]
-            vis_tokens = einops.rearrange(vis_tokens, "(b s) t d -> b s t d", b=B, s=S)
-            tokens_list.append(vis_tokens)
-
-        tokens_list.append(state_tokens)
+                tokens_list.append(state_tokens)
 
         # ---------------------------------------------------------------------
         # 3. Concatenate & Return
@@ -1278,102 +1413,3 @@ class CustomDiffusionModelWrapper(DiffusionModel):
             sample = getattr(step_out, "prev_sample", step_out)
 
         return sample
-    
-    def compute_loss(self, batch: dict[str, Tensor]) -> Tensor:
-        """
-        This function expects `batch` to have (at least):
-        {
-            "observation.state": (B, n_obs_steps, state_dim)
-
-            "observation.images": (B, n_obs_steps, num_cameras, C, H, W)
-                AND/OR
-            "observation.environment_state": (B, n_obs_steps, environment_dim)
-
-            "action": (B, horizon, action_dim)
-            "action_is_pad": (B, horizon)
-        }
-        """
-        # Input validation.
-        assert set(batch).issuperset({OBS_STATE, ACTION, "action_is_pad"})
-        assert OBS_IMAGES in batch or OBS_ENV_STATE in batch
-        n_obs_steps = batch[OBS_STATE].shape[1]
-        horizon = batch[ACTION].shape[1]
-        assert horizon == self.config.horizon
-        assert n_obs_steps == self.config.n_obs_steps
-
-        # Encode image features and concatenate them all together along with the state vector.
-        global_cond = self._prepare_global_conditioning(batch)  # (B, global_cond_dim)
-
-        # Forward diffusion.
-        trajectory = batch[ACTION]
-        # Sample noise to add to the trajectory.
-        eps = torch.randn(trajectory.shape, device=trajectory.device)
-        # Sample a random noising timestep for each item in the batch.
-        timesteps = torch.randint(
-            low=0,
-            high=self.noise_scheduler.config.num_train_timesteps,
-            size=(trajectory.shape[0],),
-            device=trajectory.device,
-        ).long()
-        # Add noise to the clean trajectories according to the noise magnitude at each timestep.
-        noisy_trajectory = self.noise_scheduler.add_noise(trajectory, eps, timesteps)
-
-        # Run the denoising network (that might denoise the trajectory, or attempt to predict the noise).
-        pred = self.unet(noisy_trajectory, timesteps, global_cond=global_cond)
-
-        # Compute the loss.
-        # The target is either the original trajectory, or the noise.
-        if self.config.prediction_type == "epsilon":
-            target = eps
-        elif self.config.prediction_type == "sample":
-            target = batch[ACTION]
-        else:
-            raise ValueError(f"Unsupported prediction type {self.config.prediction_type}")
-
-        loss = F.mse_loss(pred, target, reduction="none")
-
-        # Mask loss wherever the action is padded with copies (edges of the dataset trajectory).
-        if self.config.do_mask_loss_for_padding:
-            if "action_is_pad" not in batch:
-                raise ValueError(
-                    "You need to provide 'action_is_pad' in the batch when "
-                    f"{self.config.do_mask_loss_for_padding=}."
-                )
-            in_episode_bound = ~batch["action_is_pad"]
-            loss = loss * in_episode_bound.unsqueeze(-1)
-        
-        # 1. 计算原本的主任务 Loss (Diffusion 去噪 Loss)
-        diffusion_loss = loss.mean()
-        total_loss = diffusion_loss
-
-        # 2. 【新增】：计算视角权重的熵正则化 Loss (Entropy Loss)
-        # 只有在启用了 view scoring 并且成功保存了权重时才计算
-        if getattr(self.config, "use_view_scoring", False) and hasattr(self, "_last_view_weights"):
-            weights = self._last_view_weights
-            
-            # 鼓励权重整体偏小（没用的镜头尽量压到 0）
-            # weights.mean() 越小，说明网络越克制
-            sparsity_penalty = weights.mean() 
-            
-            # 系数可以设置在 0.01 左右
-            sparsity_weight = getattr(self.config, "view_sparsity_weight", 0.01)
-            
-            total_loss = diffusion_loss + sparsity_weight * sparsity_penalty
-
-        return total_loss
-    
-    def _maybe_log_view_scores(self, weights: torch.Tensor) -> None:
-        if self.view_score_log_interval <= 0:
-            return
-        self._view_score_call_count += 1
-        if self._view_score_call_count % self.view_score_log_interval != 0:
-            return
-        avg_weights = weights.detach().mean(dim=0).cpu().tolist()
-        entry = {
-            "step": self._view_score_call_count,
-            "avg_weights": avg_weights,
-            "timestamp": time.time(),
-        }
-        self.view_score_log_path.parent.mkdir(parents=True, exist_ok=True)
-        with self.view_score_log_path.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
