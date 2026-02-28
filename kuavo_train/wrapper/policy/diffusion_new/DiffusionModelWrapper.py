@@ -715,6 +715,7 @@ class DFomerRGBDBackbone(nn.Module):
     def get_out_channels(self):
         return self.out_channels
 
+
 class SiglipDFormerEncoder(nn.Module):
     """
     整理后的 SigLIP + DFormer 双塔编码器
@@ -727,6 +728,11 @@ class SiglipDFormerEncoder(nn.Module):
         # 1. 加载 SigLIP
         siglip_is_local = "/" in config.siglip_model_name
         self.siglip = SiglipVisionModel.from_pretrained(
+            config.siglip_model_name,
+            local_files_only=siglip_is_local
+        )
+
+        self.siglip_processor = SiglipImageProcessor.from_pretrained(
             config.siglip_model_name,
             local_files_only=siglip_is_local
         )
@@ -786,7 +792,7 @@ class SiglipDFormerEncoder(nn.Module):
         self.register_buffer("pos_embed", pos_embed)
 
         # 7. ToMe 配置
-        self.tome_compress_ratio = getattr(config, "tome_compress_ratio", 2)
+        self.tome_compress_ratio = getattr(config, "tome_compress_ratio", 1)
         # 🌟 新增：每次迭代允许合并的最大比例 (默认 5%)
         self.tome_step_ratio = getattr(config, "tome_step_ratio", 0.05)
 
@@ -858,10 +864,11 @@ class SiglipDFormerEncoder(nn.Module):
         context = torch.enable_grad() if requires_grad else torch.no_grad()
         
         with context:
-            siglip_out = self.siglip(rgb, interpolate_pos_encoding=True)
-            sig_hidden = getattr(siglip_out, "last_hidden_state", siglip_out[0])
+            siglip_in = self.siglip_processor(images=rgb, do_resize=False, do_rescale=False, return_tensors="pt")
+            siglip_out = self.siglip(siglip_in['pixel_values'].to(rgb.device), interpolate_pos_encoding=True)
+            siglip_feat = siglip_out.last_hidden_state # Shape: [B, N_sig, D_sig]
             
-        sig_tokens = self.proj_siglip(sig_hidden) 
+        sig_tokens = self.proj_siglip(siglip_feat) 
 
         df_feats = self.dformer_backbone(rgb, depth)
         df_map = df_feats[self.dformer_stage_idx] 

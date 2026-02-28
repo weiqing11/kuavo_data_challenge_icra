@@ -207,8 +207,8 @@ class HybridDiT(nn.Module):
         token_dim: int,
         max_image_tokens: int,
         hidden_size: int = 1152,
-        depth: int = 12,                  # DiT 主体深度
-        image_aggregator_depth: int = 2,  # 图像预处理深度 (关键超参)
+        depth: int = 12,
+        image_aggregator_depth: int = 2,
         num_heads: int = 16,
         mlp_ratio: float = 4.0,
     ):
@@ -217,12 +217,14 @@ class HybridDiT(nn.Module):
         self.action_seq_len = action_seq_len
         self.n_obs_steps = n_obs_steps
         self.hidden_size = hidden_size
+        self.max_image_tokens = max_image_tokens  # 新增：显式记录每步图像 token 数
         
         # --- 1. Projections & Embedders ---
         self.action_proj = nn.Linear(action_dim, hidden_size)
         self.cond_proj = nn.Linear(token_dim, hidden_size)
         self.t_embedder = TimestepEmbedder(hidden_size)
         self.state_embedder = ConditionEmbedder((n_obs_steps + 1) * token_dim, hidden_size)
+        self.lang_embedder = ConditionEmbedder(token_dim, hidden_size)  # 新增：language -> AdaLN
 
         # --- 2. Positional Embeddings ---
         self.num_cameras = 3
@@ -252,11 +254,12 @@ class HybridDiT(nn.Module):
         nn.init.normal_(self.camera_embed, std=0.02)
         nn.init.normal_(self.action_pos_embed, std=0.02)
 
-        # State Embedder
-        for layer in self.state_embedder.mlp:
-            if isinstance(layer, nn.Linear):
-                nn.init.xavier_uniform_(layer.weight)
-                nn.init.constant_(layer.bias, 0)
+        # State / Language Embedder
+        for embedder in [self.state_embedder, self.lang_embedder]:
+            for layer in embedder.mlp:
+                if isinstance(layer, nn.Linear):
+                    nn.init.xavier_uniform_(layer.weight)
+                    nn.init.constant_(layer.bias, 0)
 
         # Timestep Embedder
         nn.init.normal_(self.t_embedder.mlp[0].weight, std=0.02)
@@ -281,60 +284,53 @@ class HybridDiT(nn.Module):
 
     def forward(self, x, timestep, global_cond):
         """
-        前向传播
-        x: (B, T_act, action_dim) - 噪声动作
-        timestep: (B,) - 扩散时间步
-        global_cond: (B, S, Total_Tokens, D) - 视觉特征与状态向量
+        x: (B, T_act, action_dim)
+        timestep: (B,)
+        global_cond: (B, S, Total_Tokens, D), 约定顺序 [img..., state, language]
         """
-        B, S, _, _ = global_cond.shape
-        
-        # === 1. 分离 Image 和 State ===
-        img_tokens = global_cond[..., :-1, :]   # (B, S, T_img, D)
-        state_tokens = global_cond[..., -1, :]  # (B, S, D)
-        
-        # === 2. 状态融合计算 ===
-        state_all = state_tokens.reshape(B, -1) 
+        B, S, T_total, _ = global_cond.shape
+
+        # === 1. 分离 Image / State / Language ===
+        # 支持两种情况：
+        # 1) 只有 state:    Total = max_image_tokens + 1
+        # 2) state+language:Total = max_image_tokens + 2
+        has_language = (T_total >= self.max_image_tokens + 2)
+
+        img_tokens = global_cond[:, :, :self.max_image_tokens, :]                  # (B, S, T_img, D)
+        state_tokens = global_cond[:, :, self.max_image_tokens, :]                 # (B, S, D)
+        lang_tokens = global_cond[:, :, self.max_image_tokens + 1, :] if has_language else None  # (B, S, D) or None
+
+        # === 2. 状态 + 语言 融合为 AdaLN 条件 ===
+        state_all = state_tokens.reshape(B, -1)  # (B, S*D)
         if S > 1:
             state_delta = state_tokens[:, -1, :] - state_tokens[:, -2, :]
         else:
             state_delta = torch.zeros_like(state_tokens[:, 0, :])
-            
-        state_flat = torch.cat([state_all, state_delta], dim=-1)
-        c = self.t_embedder(timestep) + self.state_embedder(state_flat)  # AdaLN Condition
-        
+
+        state_flat = torch.cat([state_all, state_delta], dim=-1)  # (B, (S+1)*D)
+        c = self.t_embedder(timestep) + self.state_embedder(state_flat)
+
+        # 只注入一个 step 的 language（按你的要求）
+        if has_language:
+            lang_one_step = lang_tokens[:, 0, :]  # 取第 0 帧；若你想取最后一帧可改为 [:, -1, :]
+            c = c + self.lang_embedder(lang_one_step)
+
         # === 3. 处理 Context (Image) ===
-        # === 3. 处理 Context (Image) 🌟 核心修改 ===
-        # 先做线性映射
-        img_emb = self.cond_proj(img_tokens) 
-        
-        # 计算单张图片的 Token 数 T_img (总 Token 数 / 相机数)
+        img_emb = self.cond_proj(img_tokens)
         T_img = img_emb.shape[2] // self.num_cameras
-        
-        # 🌟 升维至 5D: [B, 帧数, 相机数, 单图Token数, D]
-        # 这一步极其关键，确保了维度的物理意义绝对对齐
         img_emb_5d = img_emb.reshape(B, self.n_obs_steps, self.num_cameras, T_img, self.hidden_size)
-        
-        # 🌟 魔法发生的地方：利用 PyTorch 广播机制，无缝叠加多维标签
-        # img_emb_5d : [B, 2, 3, T_img, D]
-        # step_embed : [1, 2, 1,   1,   D] -> 自动广播到所有相机和所有Token
-        # camera_embed:[1, 1, 3,   1,   D] -> 自动广播到所有时间帧和所有Token
         img_emb_5d = img_emb_5d + self.step_embed + self.camera_embed
-        
-        # 贴完标签后，重新展平为 3D 序列，送给 Transformer
-        # 最终 shape: [B, 2 * 3 * T_img, D]
         img_seq = img_emb_5d.reshape(B, -1, self.hidden_size)
-        
-        # 通过聚合器建立图像全局上下文
         img_seq_contextualized = self.image_aggregator(img_seq)
 
         # === 4. 处理 Query (Action) ===
         x_emb = self.action_proj(x)
         x_emb = x_emb + self.action_pos_embed[:, :x_emb.shape[1], :]
-        
+
         # === 5. Cross-Attention Transformer ===
         for block in self.blocks:
             x_emb = block(x_emb, context=img_seq_contextualized, c=c)
-            
+
         # === 6. 预测输出 ===
         out = self.final_layer(x_emb, c)
         return out

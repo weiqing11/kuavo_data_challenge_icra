@@ -9,7 +9,7 @@ hydra:  # Hydra config directory, for parameter checking only
     subdir: ${hydra:job.override_dirname}
 
 task: "Task1"  # Custom task name. If using huggingface datasets instead of local dataset...
-method: "siglip_DFormer_S_train_ToMe"  # Custom method name
+method: "siglip_DFormer_S_train_1"  # Custom method name
 timestamp: ${now:%Y%m%d_%H%M%S}  # Auto-obtained timestamp
 repoid: "lerobot/${task}"  # Newer versions of lerobot require this, for lerobot reference only.
 root: "/home/liangweiqing/data/code/kuavo_data_challenge_icra/datasets/Task1"  # Locally converted lerobot dataset directory
