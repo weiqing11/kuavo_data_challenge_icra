@@ -38,6 +38,9 @@ import torch
 from tqdm import tqdm
 
 from kuavo_train.wrapper.policy.diffusion_new.DiffusionPolicyWrapper import CustomDiffusionPolicyWrapper
+from kuavo_train.wrapper.policy.diffusion_idp3.DiffusionIDP3PolicyWrapper import (
+    DiffusionIDP3PolicyWrapper,
+)
 #from kuavo_train.wrapper.policy.diffusion.DiffusionPolicyWrapper import CustomDiffusionPolicyWrapper
 from kuavo_train.wrapper.policy.act.ACTPolicyWrapper import CustomACTPolicyWrapper
 from kuavo_train.wrapper.policy.idp3.modeling_idp3 import IDP3Policy
@@ -150,6 +153,8 @@ def setup_policy(pretrained_path, policy_type, device=torch.device("cuda")):
         policy = PolicyClient()
     elif policy_type == 'idp3':
         policy = IDP3Policy.from_pretrained(Path(pretrained_path),strict=True)
+    elif policy_type == "diffusion_idp3":
+        policy = DiffusionIDP3PolicyWrapper.from_pretrained(Path(pretrained_path), strict=True)
     else:
         raise ValueError(f"Unsupported policy type: {policy_type}")
     
@@ -414,4 +419,3 @@ def kuavo_eval_autotest(config: KuavoConfig):
     init_service.shutdown()
     pause_sub.unregister()
     stop_sub.unregister()
-

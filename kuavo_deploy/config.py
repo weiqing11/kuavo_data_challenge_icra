@@ -171,15 +171,16 @@ class ConfigInference:
         'wrist_cam_r': 'depth_r'
     })
     point_cloud_method : str = "fps"
+    point_cloud_task_id: int = 1
 
     def validate(self):
-        if self.policy_type not in ["diffusion", "act", "idp3"]:
+        if self.policy_type not in ["diffusion", "act", "idp3", "diffusion_idp3"]:
             # 若将来支持更多策略，请在此扩展
             # Expansion room for future support for other policies
             raise ValueError(f"Unsupported policy_type '{self.policy_type}'")
         if self.device not in ["cuda", "cpu"]:
             raise ValueError("device must be 'cuda' or 'cpu'")
-        if self.policy_type in ["idp3"]:
+        if self.policy_type in ["idp3", "diffusion_idp3"]:
             # 如果未来支持更多需要点云的策略，请在此扩展
             self.need_point_cloud = True
 

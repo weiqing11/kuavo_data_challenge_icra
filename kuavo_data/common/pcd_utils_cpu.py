@@ -87,7 +87,9 @@ def clean_point_cloud(pcd, task_id, camera_id, max_dist, remove_outliers):
         if max_dist is None:
             if camera_id == 'cam_h':
                 max_dist = 0.7
-            elif camera_id in ['cam_l', 'cam_r']:
+            elif camera_id == 'cam_l':
+                max_dist = 0.1
+            elif camera_id == 'cam_r':
                 max_dist = 0.4
             else:
                 raise ValueError(f"Unknown camera ID: {camera_id}")

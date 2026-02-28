@@ -17,7 +17,7 @@ import torch
 from torchvision.transforms.functional import to_tensor
 from kuavo_deploy.utils.obs_buffer import ObsBuffer
 from kuavo_deploy.utils.signal_controller import ControlSignalManager
-from kuavo_data.common.pcd_utils_cpu import process_pcd_task1
+from kuavo_data.common.pcd_utils_cpu import process_pcd_task
 
 
 log_robot = setup_logger("robot")
@@ -76,6 +76,7 @@ class KuavoBaseRosEnv(gym.Env):
             self.point_cloud_num_points = getattr(config_kuavo_inference, "point_cloud_num_points")
             self.point_cloud_channels = getattr(config_kuavo_inference, "point_cloud_channels")
             self.point_cloud_key_map = getattr(config_kuavo_inference, "point_cloud_keys")
+            self.point_cloud_task_id = int(getattr(config_kuavo_inference, "point_cloud_task_id"))
             # 预先计算输出 key 的映射 (例如: head_cam_h -> observation.pc_h)
             self.pc_output_map = {}
             for rgb_key in self.point_cloud_key_map.keys():
@@ -543,10 +544,11 @@ class KuavoBaseRosEnv(gym.Env):
                     raise ValueError(f"Point Cloud Error: Missing RGB frame for {rgb_key}. Waiting for callback?")
                 if depth_frame is None:
                     raise ValueError(f"Point Cloud Error: Missing Depth frame for {depth_key}. Waiting for callback?")
-                pcd_array = process_pcd_task1(
+                pcd_array = process_pcd_task(
                     rgb_frame, 
                     depth_frame, 
                     camera_id=camera_id, 
+                    task_id=self.point_cloud_task_id,
                     method=self.point_cloud_method,
                     target_points=self.point_cloud_num_points
                 )
@@ -566,8 +568,9 @@ class KuavoBaseRosEnv(gym.Env):
                     pcd_array = pcd_array[:, :target_channels]
                 elif cur_channels < target_channels:
                     raise ValueError(f"Point Cloud Error: Not enough channels in the point cloud! Got {cur_channels}, but expected {target_channels}.")
-                obs[out_key] = torch.from_numpy(pcd_array).float().unsqueeze(0)
                 '''
+                obs[out_key] = torch.from_numpy(pcd_array).float().unsqueeze(0)
+                
         return obs
 
     def close(self):

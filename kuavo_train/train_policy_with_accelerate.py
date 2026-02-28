@@ -24,6 +24,9 @@ from lerobot.datasets.utils import dataset_to_policy_features
 from lerobot.utils.random_utils import set_seed
 from lerobot.policies.factory import make_pre_post_processors
 from kuavo_train.wrapper.policy.diffusion_new.DiffusionPolicyWrapper import CustomDiffusionPolicyWrapper
+from kuavo_train.wrapper.policy.diffusion_idp3.DiffusionIDP3PolicyWrapper import (
+    DiffusionIDP3PolicyWrapper,
+)
 #from kuavo_train.wrapper.policy.diffusion.DiffusionPolicyWrapper import CustomDiffusionPolicyWrapper
 from kuavo_train.wrapper.policy.act.ACTPolicyWrapper import CustomACTPolicyWrapper
 from kuavo_train.wrapper.policy.idp3.modeling_idp3 import IDP3Policy
@@ -121,6 +124,7 @@ def build_optimizer_and_scheduler(policy, cfg, total_frames, accelerator):
 def build_policy(name, policy_cfg):
     policy = {
         "diffusion": CustomDiffusionPolicyWrapper,
+        "diffusion_idp3": DiffusionIDP3PolicyWrapper,
         "act": CustomACTPolicyWrapper,
         "idp3": IDP3Policy,
     }[name](policy_cfg)

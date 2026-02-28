@@ -99,7 +99,7 @@ inference:
   max_episode_steps: 200  # Max episode steps. Stops after this threshold. Increase for longer tasks.
 
 # 新增点云配置选项，决定环境侧会给出什么点云
-# 目前num_points和channels固定在代码里面了，需要更改
+# 目前num_points和channels并未启用，根据process_pcd_task函数默认生成4096_6的点云提供给模型
   need_point_cloud: true
   point_cloud_num_points: 4096
   point_cloud_channels: 6
@@ -107,4 +107,5 @@ inference:
     head_cam_h: "depth_h"
     wrist_cam_l: "depth_l"
     wrist_cam_r: "depth_r"
+  point_cloud_task_id: 1
   point_cloud_method: "fps"
