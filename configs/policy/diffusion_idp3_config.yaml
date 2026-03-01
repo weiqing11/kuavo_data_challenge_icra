@@ -12,7 +12,7 @@ task: "diffusion_idp3"
 method: "baseline"
 timestamp: ${now:%Y%m%d_%H%M%S}
 repoid: "lerobot/${task}"
-root: "/home/wushihan/data/Codes/kuavo_data_challenge_icra/dataset/kdc_pcd_3view/Task1_3v_fps_4096_6/lerobot"
+root: "/home/wushihan/data/Codes/kuavo_data_challenge_icra/dataset/mini_data_set/task2/lerobot"
 
 # =========================================================
 # Training
@@ -20,7 +20,7 @@ root: "/home/wushihan/data/Codes/kuavo_data_challenge_icra/dataset/kdc_pcd_3view
 training:
   output_directory: "outputs/train/${task}/${method}"
   seed: 42
-  max_epoch: 100
+  max_epoch: 1
   save_freq_epoch: 10
   log_freq: 1
   device: "cuda"
@@ -32,7 +32,7 @@ training:
   drop_last: False
   max_training_step: null
 
-  resume: true
+  resume: false
   resume_timestamp: "run_20260227_112811"
 
   RGB_Augmenter:
@@ -57,13 +57,13 @@ training:
 policy_name: diffusion_idp3
 
 policy:
-  _target_: kuavo_train.wrapper.policy.diffusion_idp3.DiffusionIDP3ConfigWrapper
+  _target_: kuavo_train.wrapper.policy.diffusion_idp3.DiffusionIDP3ConfigWrapper.DiffusionIDP3ConfigWrapper
   n_obs_steps: 2
   horizon: 16
   n_action_steps: 8
   drop_n_last_frames: 7
 
-  vision_backbone: "siglip_dformer"
+  vision_backbone: "siglip_only"
 
   normalization_mapping:
     VISUAL: { _target_: lerobot.configs.types.NormalizationMode, value: IDENTITY }
@@ -104,8 +104,8 @@ policy:
   scheduler_warmup_steps: 500
 
   custom:
-    # RGB-D
-    use_depth: true
+    # RGB only (SigLIP) + Point Cloud
+    use_depth: false
     depth_backbone: resnet18
     use_separate_depth_encoder_per_camera: False
     resize_shape: [224, 224]
@@ -131,10 +131,8 @@ policy:
     perceiver_depth: 2
 
     # vision backbones + LoRA
-    vision_backbone_rgbd: "DFormerv2_small"
-    dino_model_name: "dinov3/facebook:dinov3-vitb16-pretrain-lvd1689m"
+    # SigLIP-only RGB encoder (no DFormer/DINO in this policy)
     siglip_model_name: "google/siglip2-base-patch16-224"
-    DFormer_path: "/home/wushihan/data/Codes/kuavo_data_challenge_icra/dataset/models/DFormerv2_pretrained/DFormerv2/pretrained/DFormerv2_Small_pretrained.pth"
     vision_encoder_mode: patches
     use_lora: True
     lora_rank: 16
@@ -149,8 +147,8 @@ policy:
     point_cloud_keys: ["observation.pc_h", "observation.pc_l", "observation.pc_r"]
     point_cloud_encoder_type: "idp3_multi_stage_pointnet"
     point_cloud_num_points: 1024
-    point_cloud_in_channels: 3
+    point_cloud_in_channels: 6
     point_cloud_out_channels: 128
     point_cloud_project_dim: 384
     strict_point_cloud_keys: true
-    point_cloud_downsample: false
+    point_cloud_downsample: true

@@ -1,20 +1,21 @@
+"""Configuration wrapper for the diffusion_idp3 policy."""
+
 from __future__ import annotations
 
 import copy
-from copy import deepcopy
 from dataclasses import dataclass, field, fields
 from pathlib import Path
-from typing import Any, TypeVar
+from typing import Any, Dict, TypeVar
 
 import draccus
 from huggingface_hub.constants import CONFIG_NAME
 from omegaconf import DictConfig, ListConfig, OmegaConf
 
 from lerobot.configs.policies import PreTrainedConfig
+from lerobot.policies.diffusion.configuration_diffusion import DiffusionConfig
 from lerobot.configs.types import FeatureType, NormalizationMode, PolicyFeature
 from lerobot.optim.optimizers import AdamConfig, AdamWConfig
-from lerobot.policies.diffusion.configuration_diffusion import DiffusionConfig
-
+from kuavo_train.logger import logger
 
 T = TypeVar("T", bound="DiffusionIDP3ConfigWrapper")
 
@@ -22,17 +23,34 @@ T = TypeVar("T", bound="DiffusionIDP3ConfigWrapper")
 @PreTrainedConfig.register_subclass("diffusion_idp3")
 @dataclass
 class DiffusionIDP3ConfigWrapper(DiffusionConfig):
-    custom: dict[str, Any] = field(default_factory=dict)
+    """
+    Purpose:
+        Extend the base DiffusionConfig with custom fields for RGB + point cloud fusion.
+    Inputs (constructor):
+        Uses DiffusionConfig fields plus a `custom` dictionary.
+    Outputs (constructor):
+        None.
+    """
 
-    def __post_init__(self):
-        # Keep parent validations while bypassing strict backbone/scheduler checks in parent constructor.
+    custom: Dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        """
+        Purpose:
+            Initialize config defaults, merge normalization mappings, and expand custom fields.
+        Inputs:
+            None.
+        Outputs:
+            None.
+        """
         vision_backbone = self.vision_backbone
-        self.vision_backbone = "resnet18"
         noise_scheduler = self.noise_scheduler_type
+        # Temporary override for parent checks.
+        self.vision_backbone = "resnet18"
         self.noise_scheduler_type = "DDPM"
         super().__post_init__()
-        self.noise_scheduler_type = noise_scheduler
         self.vision_backbone = vision_backbone
+        self.noise_scheduler_type = noise_scheduler
 
         default_map = {
             "VISUAL": NormalizationMode.MEAN_STD,
@@ -44,139 +62,126 @@ class DiffusionIDP3ConfigWrapper(DiffusionConfig):
         self.normalization_mapping = merged
 
         if isinstance(self.custom, (DictConfig, dict)):
-            for key, value in self.custom.items():
-                if hasattr(self, key):
+            for k, v in self.custom.items():
+                if not hasattr(self, k):
+                    setattr(self, k, v)
+                else:
                     raise ValueError(
-                        f"Custom setting `{key}: {value}` conflicts with base configuration fields."
+                        f"Custom setting '{k}: {v}' conflicts with base config. Remove it from 'custom'."
                     )
-                setattr(self, key, value)
-
-        self._set_point_cloud_defaults()
         self._convert_omegaconf_fields()
 
-    def _set_point_cloud_defaults(self) -> None:
-        if not hasattr(self, "use_point_cloud"):
-            self.use_point_cloud = True
-        if not hasattr(self, "point_cloud_keys"):
-            self.point_cloud_keys = ["observation.pc_h", "observation.pc_l", "observation.pc_r"]
-        if not hasattr(self, "point_cloud_encoder_type"):
-            self.point_cloud_encoder_type = "idp3_multi_stage_pointnet"
-        if not hasattr(self, "strict_point_cloud_keys"):
-            self.strict_point_cloud_keys = True
-        if not hasattr(self, "point_cloud_downsample"):
-            self.point_cloud_downsample = False
-        if not hasattr(self, "point_cloud_out_channels"):
-            self.point_cloud_out_channels = 128
-        if not hasattr(self, "point_cloud_project_dim"):
-            self.point_cloud_project_dim = getattr(self, "transformer_n_emb", 384)
-
-        keys = list(getattr(self, "point_cloud_keys", []))
-        if len(keys) > 0:
-            first_key = keys[0]
-            if first_key in self.input_features:
-                first_ft = self.input_features[first_key]
-                if not hasattr(self, "point_cloud_num_points"):
-                    self.point_cloud_num_points = first_ft.shape[0]
-                if not hasattr(self, "point_cloud_in_channels"):
-                    self.point_cloud_in_channels = first_ft.shape[1]
-
-        if not hasattr(self, "point_cloud_num_points"):
-            self.point_cloud_num_points = 4096
-        if not hasattr(self, "point_cloud_in_channels"):
-            self.point_cloud_in_channels = 6
-
-    def _convert_omegaconf_fields(self):
+    def _convert_omegaconf_fields(self) -> None:
+        """
+        Purpose:
+            Convert OmegaConf containers to native Python types.
+        Inputs:
+            None.
+        Outputs:
+            None.
+        """
         for f in fields(self):
-            value = getattr(self, f.name)
-            if isinstance(value, (ListConfig, DictConfig)):
-                setattr(self, f.name, OmegaConf.to_container(value, resolve=True))
-
-        # convert dynamically injected custom fields as well
-        for key, value in list(self.__dict__.items()):
-            if isinstance(value, (ListConfig, DictConfig)):
-                setattr(self, key, OmegaConf.to_container(value, resolve=True))
+            val = getattr(self, f.name)
+            if isinstance(val, (ListConfig, DictConfig)):
+                converted = OmegaConf.to_container(val, resolve=True)
+                setattr(self, f.name, converted)
 
     @property
     def image_features(self) -> dict[str, PolicyFeature]:
-        rgb_type = getattr(FeatureType, "RGB", None)
+        """
+        Purpose:
+            Return RGB/visual input features.
+        Inputs:
+            None.
+        Outputs:
+            image_features: dict of PolicyFeature entries keyed by observation name.
+        """
         return {
             key: ft
             for key, ft in self.input_features.items()
-            if (ft.type is FeatureType.VISUAL) or (rgb_type is not None and ft.type is rgb_type)
+            if ft.type in (FeatureType.VISUAL, getattr(FeatureType, "RGB", FeatureType.VISUAL))
         }
 
     @property
     def depth_features(self) -> dict[str, PolicyFeature]:
-        depth_type = getattr(FeatureType, "DEPTH", None)
-        if depth_type is None:
-            return {}
-        return {key: ft for key, ft in self.input_features.items() if ft.type is depth_type}
+        """
+        Purpose:
+            Return depth input features (typed as VISUAL in this project).
+        Inputs:
+            None.
+        Outputs:
+            depth_features: dict of PolicyFeature entries keyed by observation name.
+        """
+        return {
+            key: ft
+            for key, ft in self.input_features.items()
+            if ft.type is getattr(FeatureType, "DEPTH", FeatureType.VISUAL)
+        }
 
     def validate_features(self) -> None:
-        has_point_cloud = bool(getattr(self, "use_point_cloud", True) and len(getattr(self, "point_cloud_keys", [])) > 0)
-        if len(self.image_features) == 0 and self.env_state_feature is None and not has_point_cloud:
-            raise ValueError("You must provide image features, environment state, or point-cloud features.")
+        """
+        Purpose:
+            Validate that required inputs (RGB, env state, or point cloud) are present and consistent.
+        Inputs:
+            None.
+        Outputs:
+            None.
+        """
+        use_point_cloud = getattr(self, "use_point_cloud", False)
+        if len(self.image_features) == 0 and self.env_state_feature is None and not use_point_cloud:
+            raise ValueError("You must provide at least one image, environment state, or point cloud input.")
 
-        if self.crop_shape is not None:
-            if isinstance(self.crop_shape[0], (list, tuple)):
-                (x_start, x_end), (y_start, y_end) = self.crop_shape
-                for key, image_ft in self.image_features.items():
-                    if x_start < 0 or x_end > image_ft.shape[1] or y_start < 0 or y_end > image_ft.shape[2]:
-                        raise ValueError(
-                            f"`crop_shape` {self.crop_shape} must fit image shape {image_ft.shape} ({key})."
-                        )
-            else:
-                for key, image_ft in self.image_features.items():
-                    if self.crop_shape[0] > image_ft.shape[1] or self.crop_shape[1] > image_ft.shape[2]:
-                        raise ValueError(
-                            f"`crop_shape` {self.crop_shape} must fit image shape {image_ft.shape} ({key})."
-                        )
-
+        # Validate image shapes are consistent.
         if len(self.image_features) > 0:
             first_image_key, first_image_ft = next(iter(self.image_features.items()))
+            if self.crop_shape is not None:
+                if isinstance(self.crop_shape[0], (list, tuple)):
+                    (x_start, x_end), (y_start, y_end) = self.crop_shape
+                    for key, image_ft in self.image_features.items():
+                        if x_start < 0 or x_end > image_ft.shape[1] or y_start < 0 or y_end > image_ft.shape[2]:
+                            raise ValueError(
+                                f"crop_shape {self.crop_shape} must fit within image shape {image_ft.shape} for {key}."
+                            )
+                else:
+                    for key, image_ft in self.image_features.items():
+                        if self.crop_shape[0] > image_ft.shape[1] or self.crop_shape[1] > image_ft.shape[2]:
+                            raise ValueError(
+                                f"crop_shape {self.crop_shape} must fit within image shape {image_ft.shape} for {key}."
+                            )
             for key, image_ft in self.image_features.items():
                 if image_ft.shape != first_image_ft.shape:
-                    raise ValueError(
-                        f"`{key}` shape {image_ft.shape} does not match `{first_image_key}` shape {first_image_ft.shape}."
-                    )
+                    raise ValueError(f"Image shape mismatch: {key} vs {first_image_key}.")
 
-        if len(self.depth_features) > 0:
+        # Validate depth shapes when enabled.
+        if getattr(self, "use_depth", False) and len(self.depth_features) > 0:
             first_depth_key, first_depth_ft = next(iter(self.depth_features.items()))
-            for key, depth_ft in self.depth_features.items():
-                if depth_ft.shape != first_depth_ft.shape:
-                    raise ValueError(
-                        f"`{key}` shape {depth_ft.shape} does not match `{first_depth_key}` shape {first_depth_ft.shape}."
-                    )
+            for key, image_ft in self.depth_features.items():
+                if image_ft.shape != first_depth_ft.shape:
+                    raise ValueError(f"Depth shape mismatch: {key} vs {first_depth_key}.")
 
-        if getattr(self, "use_point_cloud", True):
-            pc_keys = list(getattr(self, "point_cloud_keys", []))
-            if len(pc_keys) == 0:
-                raise ValueError("`use_point_cloud=True` requires non-empty `point_cloud_keys`.")
-
-            missing = [key for key in pc_keys if key not in self.input_features]
-            if missing and getattr(self, "strict_point_cloud_keys", True):
-                raise ValueError(
-                    f"Point-cloud keys missing in input features: {missing}. "
-                    f"Available keys: {sorted(self.input_features.keys())}"
-                )
-
-            if not missing:
-                for key in pc_keys:
-                    shape = self.input_features[key].shape
-                    if len(shape) != 2:
-                        raise ValueError(
-                            f"Point-cloud key `{key}` must have shape `(N, C)`, got {shape}."
-                        )
+        # Validate point cloud keys if strict.
+        if use_point_cloud and getattr(self, "strict_point_cloud_keys", False):
+            pc_keys = getattr(self, "point_cloud_keys", [])
+            for key in pc_keys:
+                if key not in self.input_features:
+                    raise ValueError(f"Point cloud key not found in input_features: {key}")
 
     def _save_pretrained(self, save_directory: Path) -> None:
-        cfg_copy = deepcopy(self)
+        """
+        Purpose:
+            Save config to disk while removing expanded custom fields.
+        Inputs:
+            save_directory: Path to write config.
+        Outputs:
+            None.
+        """
+        cfg_copy = copy.deepcopy(self)
         if isinstance(cfg_copy.custom, dict):
-            for key in list(cfg_copy.custom.keys()):
-                if hasattr(cfg_copy, key):
-                    delattr(cfg_copy, key)
-
-        with open(save_directory / CONFIG_NAME, "w") as handle, draccus.config_type("json"):
-            draccus.dump(cfg_copy, handle, indent=4)
+            for k in list(cfg_copy.custom.keys()):
+                if hasattr(cfg_copy, k):
+                    delattr(cfg_copy, k)
+        with open(save_directory / CONFIG_NAME, "w") as f, draccus.config_type("json"):
+            draccus.dump(cfg_copy, f, indent=4)
 
     @classmethod
     def from_pretrained(
@@ -184,7 +189,7 @@ class DiffusionIDP3ConfigWrapper(DiffusionConfig):
         pretrained_name_or_path: str | Path,
         *,
         force_download: bool = False,
-        resume_download: bool = None,
+        resume_download: bool | None = None,
         proxies: dict | None = None,
         token: str | bool | None = None,
         cache_dir: str | Path | None = None,
@@ -192,7 +197,16 @@ class DiffusionIDP3ConfigWrapper(DiffusionConfig):
         revision: str | None = None,
         **policy_kwargs,
     ) -> T:
-        return PreTrainedConfig.from_pretrained(
+        """
+        Purpose:
+            Load config from a pretrained directory or repo.
+        Inputs:
+            pretrained_name_or_path: path or repo ID.
+        Outputs:
+            config: DiffusionIDP3ConfigWrapper instance.
+        """
+        parent_cls = PreTrainedConfig
+        return parent_cls.from_pretrained(
             pretrained_name_or_path,
             force_download=force_download,
             resume_download=resume_download,
@@ -205,14 +219,23 @@ class DiffusionIDP3ConfigWrapper(DiffusionConfig):
         )
 
     def get_optimizer_preset(self):
+        """
+        Purpose:
+            Return optimizer preset (Adam or AdamW) based on denoiser selection.
+        Inputs:
+            None.
+        Outputs:
+            optimizer_config: AdamConfig or AdamWConfig.
+        """
         if getattr(self, "use_unet", False):
+            logger.info("Using Adam optimizer for UNet.")
             return AdamConfig(
                 lr=self.optimizer_lr,
                 betas=self.optimizer_betas,
                 eps=self.optimizer_eps,
                 weight_decay=self.optimizer_weight_decay,
             )
-
+        logger.info("Using AdamW optimizer for transformer/DiT.")
         return AdamWConfig(
             lr=self.optimizer_lr,
             betas=self.optimizer_betas,

@@ -73,9 +73,9 @@ inference:
   device: "cuda"
 
   # Must match your training output path: outputs/train/<task>/<method>/<timestamp>/epoch<epoch>
-  task: "Task1"
-  method: "diffusion_idp3_baseline"
-  timestamp: "run_YYYYMMDD_HHMMSS"
+  task: "diffusion_idp3"
+  method: "baseline"
+  timestamp: "run_20260301_141634"
   epoch: best
   max_episode_steps: 200
 

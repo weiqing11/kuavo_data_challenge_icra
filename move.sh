@@ -4,7 +4,7 @@ SSH_OPT="ssh -p 3072"
 REMOTE_HOST="agilex@121.48.164.165"
 
 # 更改参数
-MODE=${1:-"2"}
+MODE=${1:-"1"}
 
 case $MODE in
     "1")
