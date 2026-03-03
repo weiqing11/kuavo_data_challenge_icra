@@ -224,6 +224,10 @@ def run_single_episode(config, policy, preprocessor, postprocessor, episode, out
 
     step = 0
     done = False
+
+    # [新增]：从配置中读取是否开启了 delta_action（如果没配置默认 False，兼容旧模型）
+    enable_delta = config.get("training", {}).get("delta_action", {}).get("enable", False)
+
     while not done:
         # --- Pause support: block here if pause_flag is set ---
         if not check_control_signals():
@@ -231,11 +235,47 @@ def run_single_episode(config, policy, preprocessor, postprocessor, episode, out
             return 0
         
         start_time = time.time()
+
+        # =========================================================================
+        # [新增]: 在 preprocessor 归一化观测之前，保存原始的、未归一化的 State
+        # =========================================================================
+        if enable_delta:
+            raw_state_val = observation["observation.state"]
+            # 确保复制的是 Tensor 且不影响后续流水线
+            raw_state = raw_state_val.clone() if isinstance(raw_state_val, torch.Tensor) else torch.tensor(raw_state_val)
+
         observation = preprocessor(observation)
         with torch.inference_mode():
             action = policy.select_action(observation)
         log_model.info(f"Step {step}: predict action {action}")
         action = postprocessor(action)
+
+        # =========================================================================
+        # [新增]: 把 Delta Action 还原为绝对动作 (Absolute Action)
+        # =========================================================================
+        if enable_delta:
+            action_dim = action.shape[-1]
+            
+            # 提取当前时刻的基准状态，并截取对应的控制维度
+            # 兼容各种可能的环境返回维度: [S], [1, S] 或 [1, seq, S]
+            if raw_state.dim() == 1:       
+                base_state = raw_state[:action_dim].unsqueeze(0)  # [1, A]
+            elif raw_state.dim() == 2:     
+                base_state = raw_state[-1:, :action_dim]          # [1, A]
+            elif raw_state.dim() == 3:     
+                base_state = raw_state[:, -1, :action_dim]        # [B, A]
+                
+            # 确保 device 一致
+            base_state = base_state.to(action.device)
+            
+            # 还原动作：Action = Delta_Action + Base_State
+            # action 的形状通常是 [1, chunk, A]
+            if action.dim() == 3:
+                action = action + base_state.unsqueeze(1)
+            else:
+                action = action + base_state
+        # =========================================================================
+        
         # print(f"action: {action}, action.shape: {action.shape}, action min: {action.min()}, action max: {action.max()}")
         action_infer_time = time.time()
         log_model.info(f"episode {episode}, step {step}, action infer time: {action_infer_time - start_time:.3f}s")

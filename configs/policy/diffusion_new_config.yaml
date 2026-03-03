@@ -9,7 +9,7 @@ hydra:  # Hydra config directory, for parameter checking only
     subdir: ${hydra:job.override_dirname}
 
 task: "Task1"  # Custom task name. If using huggingface datasets instead of local dataset...
-method: "siglip_DFormer_S_train_1"  # Custom method name
+method: "siglip_DFormer_S_train_delta"  # Custom method name
 timestamp: ${now:%Y%m%d_%H%M%S}  # Auto-obtained timestamp
 repoid: "lerobot/${task}"  # Newer versions of lerobot require this, for lerobot reference only.
 root: "/home/liangweiqing/data/code/kuavo_data_challenge_icra/datasets/Task1"  # Locally converted lerobot dataset directory
@@ -42,6 +42,10 @@ training:
     # resume training
     resume: false
     resume_timestamp: "run_20260211_150636"  # If enabled, it will pull the last epoch from outputs/train/<task>/<method>/<resume_timestamp> to continue training
+
+    delta_action:
+      enable: true
+      stats_path: "/home/liangweiqing/data/code/kuavo_data_challenge_icra/datasets/Task1/meta/stats_delta_chunk16.json"
 
     # Data augmentation related config
     RGB_Augmenter:
@@ -156,8 +160,8 @@ policy:
       
       # === LoRA 配置 ===
       use_lora: True          # 开启 LoRA
-      lora_rank: 32            # 推荐 8 或 16
-      lora_alpha: 64           # 推荐 rank * 2
+      lora_rank: 16            # 推荐 8 或 16
+      lora_alpha: 32           # 推荐 rank * 2
       lora_dropout: 0.05
       vision_freeze: False  # 是否冻结模型参数
       vision_fusion_dim: 256

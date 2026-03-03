@@ -1,3 +1,5 @@
+import json
+
 import lerobot_patches.custom_patches  # Ensure custom patches are applied, DON'T REMOVE THIS LINE!
 from lerobot.configs.policies import PolicyFeature
 from typing import Any
@@ -171,6 +173,41 @@ def sanitize_policy_config(policy):
             setattr(policy.config, key, native_value)
             # logger.info(f"Auto-sanitized config field '{key}': {type(value)} -> {type(native_value)}")
 
+
+class DeltaActionProcessorStep(ProcessorStep):
+    def __init__(self, action_key="action", state_key="observation.state"):
+        super().__init__()
+        self.action_key = action_key
+        self.state_key = state_key
+
+    def __call__(self, transition):
+        # 复制字典以符合 ProcessorStep 的规范
+        new_transition = transition.copy()
+        
+        if self.action_key in new_transition and self.state_key in new_transition:
+            action = new_transition[self.action_key]  # 形状通常为 [B, chunk, A]
+            state = new_transition[self.state_key]    # 形状通常为 [B, S] 或 [B, seq, S]
+            
+            action_dim = action.shape[-1]
+            
+            # 提取当前状态的基准值 (base state)
+            if state.dim() == 3:
+                # 如果 state 包含时间序列维度，取第一帧（当前时刻）
+                state_base = state[:, -1, :action_dim]  # [B, A]
+            else:
+                state_base = state[:, :action_dim]     # [B, A]
+                
+            # 计算 delta action，利用 unsqueeze(1) 触发广播机制: [B, chunk, A] - [B, 1, A]
+            new_transition[self.action_key] = action - state_base.unsqueeze(1)
+            
+        return new_transition
+        
+    def transform_features(
+        self, features: dict[PipelineFeatureType, dict[str, PolicyFeature]]
+    ) -> dict[PipelineFeatureType, dict[str, PolicyFeature]]:
+        return features
+
+
 class AugmentationProcessorStep(ProcessorStep):
     def __init__(self, transform, cam_keys):
         super().__init__()
@@ -280,6 +317,29 @@ def main(cfg: DictConfig):
     # instantiate the policy
     policy_cfg = build_policy_config(cfg, input_features, output_features)
     logger.info(f"policy_cfg: {policy_cfg}")
+
+    # =========================================================================
+    # [新增]: 加载 Delta Action 的统计参数并替换到 dataset_metadata 中
+    # =========================================================================
+    if cfg.training.get("delta_action", {}).get("enable", False):
+        stats_path = cfg.training.delta_action.stats_path
+        logger.info(f"🔄 Delta Action enabled! Loading stats from {stats_path}")
+        
+        with open(stats_path, "r") as f:
+            delta_stats = json.load(f)
+            
+        action_key = "action"
+        if action_key in dataset_metadata.stats:
+            # 覆盖原有的均值和方差
+            dataset_metadata.stats[action_key]["mean"] = torch.tensor(delta_stats["mean"], dtype=torch.float32)
+            dataset_metadata.stats[action_key]["std"] = torch.tensor(delta_stats["std"], dtype=torch.float32)
+            
+            # 强制使用 MEAN_STD 归一化（因为我们没有计算 Delta 的 min/max）
+            if hasattr(policy_cfg.output_features[action_key], 'normalization_mode'):
+                policy_cfg.output_features[action_key].normalization_mode = NormalizationMode.MEAN_STD
+                logger.info(f"⚠️ Forced action normalization mode to MEAN_STD for Delta Action.")
+    # =========================================================================
+
     # Build policy
     policy = build_policy(cfg.policy_name, policy_cfg)
     accelerator.wait_for_everyone()
@@ -348,6 +408,15 @@ def main(cfg: DictConfig):
     # Training loop
     aug_step = insert_before_normalizer(preprocessor, AugmentationProcessorStep(image_transforms, dataset.meta.camera_keys))  # just for training
     
+    # =========================================================================
+    # [新增]: 将 Delta Action 转换步骤插入到 normalizer 之前
+    # =========================================================================
+    if cfg.training.get("delta_action", {}).get("enable", False):
+        delta_step = DeltaActionProcessorStep(action_key="action", state_key="observation.state")
+        insert_before_normalizer(preprocessor, delta_step)
+        logger.info("✅ Inserted DeltaActionProcessorStep before NormalizerProcessorStep")
+    # =========================================================================
+
     if hasattr(cfg.policy, "drop_n_last_frames"):
         shuffle = False
         sampler = EpisodeAwareSampler(

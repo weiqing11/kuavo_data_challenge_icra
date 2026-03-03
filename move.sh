@@ -4,7 +4,7 @@ SSH_OPT="ssh -p 3072"
 REMOTE_HOST="agilex@121.48.164.165"
 
 # 更改参数
-MODE=${1:-"1"}
+MODE=${1:-"2"}
 
 case $MODE in
     "1")
@@ -14,7 +14,7 @@ case $MODE in
         ;;
     "2")
         echo "使用配置 [2]: Task1 (baseline)"
-        SRC="/home/liangweiqing/data/code/kuavo_data_challenge_icra/outputs/train/Task1/siglip_DFormer_S_train_1"
+        SRC="/home/liangweiqing/data/code/kuavo_data_challenge_icra/outputs/train/Task1/siglip_DFormer_S_train_delta"
         DEST="/home/agilex/liangweiqing/kdc/kuavo_data_challenge_icra/outputs/train/Task1"
         ;;
     *)
