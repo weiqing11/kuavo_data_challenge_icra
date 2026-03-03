@@ -3,10 +3,12 @@ from typing import Dict, Type
 import torch.nn as nn
 
 from .multi_stage_pointnet import MultiStagePointNetEncoder
+from .pointnext_backbone import PointNeXtBackbone
 
 
 POINTNET_BACKBONE_REGISTRY: Dict[str, Type[nn.Module]] = {
     "multi_stage_pointnet": MultiStagePointNetEncoder,
+    "pointnext": PointNeXtBackbone,
 }
 
 

@@ -221,7 +221,6 @@ datasets
 *.mp4
 *.ply
 *.png
-/zyh_tmp
 /discuss
 /tmp
 /dinov2

@@ -107,10 +107,9 @@ class IDP3Config(PreTrainedConfig):
             - backbone_type: Name of the point-cloud backbone encoder.
             - in_channels: Number of input channels for the PointCloudEncoder.
             - out_channels: Number of output channels for the PointCloudEncoder.
-            - use_layernorm: Whether to use LayerNorm in the PointCloudEncoder.
-            - final_norm: The normalization layer to use at the end of the PointCloudEncoder.
-            - normal_channel: Whether the input point cloud has a normal channel.
             - num_points: Number of points in the input point cloud.
+            - state_dim: State feature dimension.
+            Backbone-specific hyperparameters are defined in each backbone implementation file.
 
     """
 
@@ -169,9 +168,6 @@ class IDP3Config(PreTrainedConfig):
         backbone_type: str = "multi_stage_pointnet"
         in_channels: int = 6 # 点云中每个点的维度，3表示x,y,z坐标，6表示x,y,z,r,g,b颜色
         out_channels: int = 128
-        use_layernorm: bool = True
-        final_norm: str = "layernorm"
-        normal_channel: bool = False
         num_points: int = 4096
         state_dim: int = 16
 
