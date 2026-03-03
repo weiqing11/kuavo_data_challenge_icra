@@ -129,10 +129,21 @@ class IDP3Encoder(nn.Module):  # noqa: N801
 
         self.pointnet_type = pointnet_type
 
+        # Pass all point-cloud encoder config fields to the selected backbone.
+        # Keep the IDP3 naming (`in_channels`) and map it to backbone naming (`pc_channels`).
+        backbone_kwargs = {}
+        if pointcloud_encoder_cfg is not None:
+            if hasattr(pointcloud_encoder_cfg, "__dict__"):
+                backbone_kwargs = dict(pointcloud_encoder_cfg.__dict__)
+            elif isinstance(pointcloud_encoder_cfg, dict):
+                backbone_kwargs = dict(pointcloud_encoder_cfg)
+        backbone_kwargs.pop("backbone_type", None)
+        backbone_kwargs["pc_channels"] = backbone_kwargs.pop("in_channels", pointcloud_encoder_cfg.in_channels)
+        backbone_kwargs["out_channels"] = backbone_kwargs.get("out_channels", pointcloud_encoder_cfg.out_channels)
+
         self.extractor = build_pointnet_backbone(
             backbone_type=self.pointnet_type,
-            pc_channels=pointcloud_encoder_cfg.in_channels,
-            out_channels=pointcloud_encoder_cfg.out_channels,
+            **backbone_kwargs,
         )
 
         if len(state_mlp_size) == 0:

@@ -6,8 +6,8 @@ hydra:
     subdir: ${hydra:job.override_dirname}
 
 # Task/dataset
-task: "idp3_3v"
-method: "1024_6"
+task: "idp3_3v_pointnext"
+method: "baseline"
 timestamp: ${now:%Y%m%d_%H%M%S}
 repoid: "lerobot/${task}"
 root: "/home/wushihan/data/Codes/kuavo_data_challenge_icra/dataset/kdc_pcd_3view/Task1_3v_fps_4096_6/lerobot"
@@ -24,7 +24,7 @@ training:
   ema_power: 0.75
 
   batch_size: 32
-  num_workers: 6 # 不能开太高，过多处理数据的worker会导致系统内存占用过高，甚至崩溃
+  num_workers: 4 # 不能开太高，过多处理数据的worker会导致系统内存占用过高，甚至崩溃
   drop_last: false
 
   max_training_step: null
@@ -80,12 +80,9 @@ policy:
 
   # Point cloud encoder
   pointcloud_encoder_cfg:
-    backbone_type: "multi_stage_pointnet"
+    backbone_type: "pointnext"
     in_channels: 6
     out_channels: 128
-    use_layernorm: true
-    final_norm: "layernorm"
-    normal_channel: false
     num_points: 1024
     state_dim: 16
 

@@ -9,8 +9,8 @@ MODE=${1:-"1"}
 case $MODE in
     "1")
         echo "使用配置 [1]: IDP3 (rgb)"
-        SRC="/home/wushihan/data/Codes/kuavo_data_challenge_icra/outputs/train/diffusion_idp3/"
-        DEST="/home/agilex/liangweiqing/kdc/kuavo_data_challenge_icra/outputs/train/diffusion_idp3"
+        SRC="/home/wushihan/data/Codes/kuavo_data_challenge_icra/outputs/train/idp3_3v_pointnext/"
+        DEST="/home/agilex/liangweiqing/kdc/kuavo_data_challenge_icra/outputs/train/idp3_3v_pointnext"
         ;;
     "2")
         echo "使用配置 [2]: Task1 (baseline)"
