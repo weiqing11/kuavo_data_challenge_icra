@@ -43,10 +43,6 @@ training:
     resume: false
     resume_timestamp: "run_20260211_150636"  # If enabled, it will pull the last epoch from outputs/train/<task>/<method>/<resume_timestamp> to continue training
 
-    delta_action:
-      enable: true
-      stats_path: "/home/liangweiqing/data/code/kuavo_data_challenge_icra/datasets/Task1/meta/stats_delta_chunk16.json"
-
     # Data augmentation related config
     RGB_Augmenter:
       enable: True
@@ -166,3 +162,7 @@ policy:
       vision_freeze: False  # 是否冻结模型参数
       vision_fusion_dim: 256
       vision_attn_heads: 8
+
+      delta_action:
+        enable: true
+        stats_path: "/home/liangweiqing/data/code/kuavo_data_challenge_icra/datasets/Task1/meta/stats_delta_chunk16.json"

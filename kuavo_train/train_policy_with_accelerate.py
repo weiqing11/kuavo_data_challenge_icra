@@ -321,7 +321,7 @@ def main(cfg: DictConfig):
     # =========================================================================
     # [新增]: 加载 Delta Action 的统计参数并替换到 dataset_metadata 中
     # =========================================================================
-    if cfg.training.get("delta_action", {}).get("enable", False):
+    if cfg.policy.custom.get("delta_action", {}).get("enable", False):
         stats_path = cfg.training.delta_action.stats_path
         logger.info(f"🔄 Delta Action enabled! Loading stats from {stats_path}")
         
@@ -411,7 +411,7 @@ def main(cfg: DictConfig):
     # =========================================================================
     # [新增]: 将 Delta Action 转换步骤插入到 normalizer 之前
     # =========================================================================
-    if cfg.training.get("delta_action", {}).get("enable", False):
+    if cfg.policy.custom.get("delta_action", {}).get("enable", False):
         delta_step = DeltaActionProcessorStep(action_key="action", state_key="observation.state")
         insert_before_normalizer(preprocessor, delta_step)
         logger.info("✅ Inserted DeltaActionProcessorStep before NormalizerProcessorStep")
@@ -487,6 +487,15 @@ def main(cfg: DictConfig):
         batch_count = 0
         for batch in epoch_bar:
             batch = preprocessor(batch)
+
+            if accelerator.is_main_process and steps == 0 and cfg.training.get("delta_action", {}).get("enable", False):
+                if "action" in batch and "observation.state" in batch:
+                    logger.info(f"[DeltaCheck] action shape: {tuple(batch['action'].shape)}")
+                    logger.info(f"[DeltaCheck] state shape: {tuple(batch['observation.state'].shape)}")
+                    logger.info(f"[DeltaCheck] action mean after preprocessor: {batch['action'].mean().item():.6f}")
+                else:
+                    logger.warning("[DeltaCheck] Missing keys: 'action' or 'observation.state'")
+
             with accelerator.accumulate(policy):
                 # batch = {k: (v.to(device, non_blocking=True) if isinstance(v, torch.Tensor) else v) for k, v in batch.items()}
                 with accelerator.autocast():
