@@ -104,6 +104,7 @@ class IDP3Config(PreTrainedConfig):
 
         pointcloud_encoder_cfg: Configuration for the PointCloudEncoder. This is a nested dataclass with the
             following fields:
+            - backbone_type: Name of the point-cloud backbone encoder.
             - in_channels: Number of input channels for the PointCloudEncoder.
             - out_channels: Number of output channels for the PointCloudEncoder.
             - use_layernorm: Whether to use LayerNorm in the PointCloudEncoder.
@@ -165,6 +166,7 @@ class IDP3Config(PreTrainedConfig):
     # Add PointCloudEncoder configuration as nested dataclass
     @dataclass
     class PointCloudEncoderConfig:
+        backbone_type: str = "multi_stage_pointnet"
         in_channels: int = 6 # 点云中每个点的维度，3表示x,y,z坐标，6表示x,y,z,r,g,b颜色
         out_channels: int = 128
         use_layernorm: bool = True

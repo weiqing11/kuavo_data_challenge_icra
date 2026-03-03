@@ -7,7 +7,7 @@ hydra:
 
 # Task/dataset
 task: "idp3_3v"
-method: "2048_3"
+method: "1024_6"
 timestamp: ${now:%Y%m%d_%H%M%S}
 repoid: "lerobot/${task}"
 root: "/home/wushihan/data/Codes/kuavo_data_challenge_icra/dataset/kdc_pcd_3view/Task1_3v_fps_4096_6/lerobot"
@@ -80,12 +80,13 @@ policy:
 
   # Point cloud encoder
   pointcloud_encoder_cfg:
-    in_channels: 3
+    backbone_type: "multi_stage_pointnet"
+    in_channels: 6
     out_channels: 128
     use_layernorm: true
     final_norm: "layernorm"
     normal_channel: false
-    num_points: 2048
+    num_points: 1024
     state_dim: 16
 
   # Diffusion-related
