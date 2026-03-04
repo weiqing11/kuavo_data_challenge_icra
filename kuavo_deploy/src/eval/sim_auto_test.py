@@ -226,7 +226,11 @@ def run_single_episode(config, policy, preprocessor, postprocessor, episode, out
     done = False
 
     # [新增]：从配置中读取是否开启了 delta_action（如果没配置默认 False，兼容旧模型）
-    enable_delta = config.get("training", {}).get("delta_action", {}).get("enable", False)
+    enable_delta = bool(
+        (policy.config.custom.get("delta_action", {}) if isinstance(policy.config.custom, dict) else policy.config.custom.delta_action).__dict__.get("enable", False)
+        if not isinstance(policy.config.custom, dict)
+        else policy.config.custom.get("delta_action", {}).get("enable", False)
+    )
 
     while not done:
         # --- Pause support: block here if pause_flag is set ---
@@ -243,15 +247,19 @@ def run_single_episode(config, policy, preprocessor, postprocessor, episode, out
             # 检查策略内部的动作队列是否为空。为空说明马上要调用 UNet 生成新的 chunk
             if len(policy._queues.get("action", [])) == 0:
                 raw_state_val = observation["observation.state"]
+                log_model.info(f"raw_state_val.shape: {raw_state_val.shape}")
                 # 深拷贝保存当前状态，作为这一整个 Chunk 的基准锚点
                 chunk_anchor_state = raw_state_val.clone() if isinstance(raw_state_val, torch.Tensor) else torch.tensor(raw_state_val)
+                log_model.info(f"Step {step}: Locking new chunk anchor state {chunk_anchor_state}")
 
         observation = preprocessor(observation)
         with torch.inference_mode():
             action = policy.select_action(observation)
-        log_model.info(f"Step {step}: predict action {action}")
         action = postprocessor(action)
-
+        if enable_delta:
+            log_model.info(f"Step {step}: predict delta action {action}")
+        else:
+            log_model.info(f"Step {step}: predict action {action}")
         # =========================================================================
         # [核心修复 2]: 始终使用锁定的 chunk_anchor_state 来还原绝对动作
         # =========================================================================

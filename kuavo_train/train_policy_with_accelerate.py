@@ -350,11 +350,8 @@ def main(cfg: DictConfig):
             # 覆盖原有的均值和方差
             dataset_metadata.stats[action_key]["mean"] = torch.tensor(delta_stats["mean"], dtype=torch.float32)
             dataset_metadata.stats[action_key]["std"] = torch.tensor(delta_stats["std"], dtype=torch.float32)
-            
-            # 强制使用 MEAN_STD 归一化（因为我们没有计算 Delta 的 min/max）
-            if hasattr(policy_cfg.output_features[action_key], 'normalization_mode'):
-                policy_cfg.output_features[action_key].normalization_mode = NormalizationMode.MEAN_STD
-                logger.info(f"⚠️ Forced action normalization mode to MEAN_STD for Delta Action.")
+            dataset_metadata.stats[action_key]["min"] = torch.tensor(delta_stats["min"], dtype=torch.float32)
+            dataset_metadata.stats[action_key]["max"] = torch.tensor(delta_stats["max"], dtype=torch.float32)
     # =========================================================================
 
     # Build policy

@@ -79,6 +79,8 @@ policy:
       VISUAL: { _target_: lerobot.configs.types.NormalizationMode, value: IDENTITY }
       RGB: { _target_: lerobot.configs.types.NormalizationMode, value: IDENTITY }
       DEPTH: { _target_: lerobot.configs.types.NormalizationMode, value: IDENTITY }
+      STATE: { _target_: lerobot.configs.types.NormalizationMode, value: MIN_MAX }
+      ACTION: { _target_: lerobot.configs.types.NormalizationMode, value: MIN_MAX }
 
     # Image cropping. Not supported in lerobot built-in policies
     crop_is_random: True
