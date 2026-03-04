@@ -237,12 +237,14 @@ def run_single_episode(config, policy, preprocessor, postprocessor, episode, out
         start_time = time.time()
 
         # =========================================================================
-        # [新增]: 在 preprocessor 归一化观测之前，保存原始的、未归一化的 State
+        # [核心修复 1]: 只在模型需要预测新 Chunk 时（队列为空），才更新/锁定 base_state
         # =========================================================================
         if enable_delta:
-            raw_state_val = observation["observation.state"]
-            # 确保复制的是 Tensor 且不影响后续流水线
-            raw_state = raw_state_val.clone() if isinstance(raw_state_val, torch.Tensor) else torch.tensor(raw_state_val)
+            # 检查策略内部的动作队列是否为空。为空说明马上要调用 UNet 生成新的 chunk
+            if len(policy._queues.get("action", [])) == 0:
+                raw_state_val = observation["observation.state"]
+                # 深拷贝保存当前状态，作为这一整个 Chunk 的基准锚点
+                chunk_anchor_state = raw_state_val.clone() if isinstance(raw_state_val, torch.Tensor) else torch.tensor(raw_state_val)
 
         observation = preprocessor(observation)
         with torch.inference_mode():
@@ -251,31 +253,28 @@ def run_single_episode(config, policy, preprocessor, postprocessor, episode, out
         action = postprocessor(action)
 
         # =========================================================================
-        # [新增]: 把 Delta Action 还原为绝对动作 (Absolute Action)
+        # [核心修复 2]: 始终使用锁定的 chunk_anchor_state 来还原绝对动作
         # =========================================================================
         if enable_delta:
             action_dim = action.shape[-1]
             
-            # 提取当前时刻的基准状态，并截取对应的控制维度
-            # 兼容各种可能的环境返回维度: [S], [1, S] 或 [1, seq, S]
-            if raw_state.dim() == 1:       
-                base_state = raw_state[:action_dim].unsqueeze(0)  # [1, A]
-            elif raw_state.dim() == 2:     
-                base_state = raw_state[-1:, :action_dim]          # [1, A]
-            elif raw_state.dim() == 3:     
-                base_state = raw_state[:, -1, :action_dim]        # [B, A]
+            # 从锁定的锚点中提取维度
+            if chunk_anchor_state.dim() == 1:       
+                base_state = chunk_anchor_state[:action_dim].unsqueeze(0)  # [1, A]
+            elif chunk_anchor_state.dim() == 2:     
+                base_state = chunk_anchor_state[-1:, :action_dim]          # [1, A]
+            elif chunk_anchor_state.dim() == 3:     
+                base_state = chunk_anchor_state[:, -1, :action_dim]        # [B, A]
                 
-            # 确保 device 一致
             base_state = base_state.to(action.device)
             
-            # 还原动作：Action = Delta_Action + Base_State
-            # action 的形状通常是 [1, chunk, A]
+            # 还原动作：Absolute_Action = Delta_Action + Chunk_Anchor_State
             if action.dim() == 3:
                 action = action + base_state.unsqueeze(1)
             else:
                 action = action + base_state
         # =========================================================================
-        
+
         # print(f"action: {action}, action.shape: {action.shape}, action min: {action.min()}, action max: {action.max()}")
         action_infer_time = time.time()
         log_model.info(f"episode {episode}, step {step}, action infer time: {action_infer_time - start_time:.3f}s")
