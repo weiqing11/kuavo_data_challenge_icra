@@ -82,7 +82,7 @@ policy:
   pointcloud_encoder_cfg:
     backbone_type: "pointnext"
     in_channels: 6
-    out_channels: 128
+    out_channels: 512
     num_points: 1024
     state_dim: 16
 

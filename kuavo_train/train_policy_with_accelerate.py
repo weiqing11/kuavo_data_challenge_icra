@@ -321,7 +321,7 @@ def main(cfg: DictConfig):
     # =========================================================================
     # [新增]: 加载 Delta Action 的统计参数并替换到 dataset_metadata 中
     # =========================================================================
-    if cfg.policy.custom.get("delta_action", {}).get("enable", False):
+    if cfg.policy.get("custom", {}).get("delta_action", {}).get("enable", False):
         stats_path = cfg.training.delta_action.stats_path
         logger.info(f"🔄 Delta Action enabled! Loading stats from {stats_path}")
         
@@ -411,7 +411,7 @@ def main(cfg: DictConfig):
     # =========================================================================
     # [新增]: 将 Delta Action 转换步骤插入到 normalizer 之前
     # =========================================================================
-    if cfg.policy.custom.get("delta_action", {}).get("enable", False):
+    if cfg.policy.get("custom", {}).get("delta_action", {}).get("enable", False):
         delta_step = DeltaActionProcessorStep(action_key="action", state_key="observation.state")
         insert_before_normalizer(preprocessor, delta_step)
         logger.info("✅ Inserted DeltaActionProcessorStep before NormalizerProcessorStep")

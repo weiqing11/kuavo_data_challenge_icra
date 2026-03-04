@@ -1,15 +1,26 @@
+import importlib
 from typing import Dict, Type
 
 import torch.nn as nn
 
-from .multi_stage_pointnet import MultiStagePointNetEncoder
-from .pointnext_backbone import PointNeXtBackbone
-
-
-POINTNET_BACKBONE_REGISTRY: Dict[str, Type[nn.Module]] = {
-    "multi_stage_pointnet": MultiStagePointNetEncoder,
-    "pointnext": PointNeXtBackbone,
+POINTNET_BACKBONE_REGISTRY: Dict[str, Type[nn.Module] | tuple[str, str]] = {
+    "multi_stage_pointnet": (".multi_stage_pointnet", "MultiStagePointNetEncoder"),
+    "pointnext": (".pointnext_backbone", "PointNeXtBackbone"),
+    "ptv3": (".pointtransformerv3_backbone", "PointTransformerV3Backbone"),
 }
+
+_MODULE_PACKAGE = __name__
+
+
+def _resolve_backbone_class(backbone_type: str) -> Type[nn.Module]:
+    entry = POINTNET_BACKBONE_REGISTRY[backbone_type]
+    if isinstance(entry, tuple):
+        module_name, class_name = entry
+        module = importlib.import_module(module_name, package=_MODULE_PACKAGE)
+        cls = getattr(module, class_name)
+        POINTNET_BACKBONE_REGISTRY[backbone_type] = cls
+        return cls
+    return entry
 
 
 def build_pointnet_backbone(backbone_type: str, **kwargs) -> nn.Module:
@@ -25,4 +36,5 @@ def build_pointnet_backbone(backbone_type: str, **kwargs) -> nn.Module:
         raise NotImplementedError(
             f"Unsupported point cloud backbone '{backbone_type}'. Available backbones: {available}"
         )
-    return POINTNET_BACKBONE_REGISTRY[backbone_type](**kwargs)
+    backbone_cls = _resolve_backbone_class(backbone_type)
+    return backbone_cls(**kwargs)

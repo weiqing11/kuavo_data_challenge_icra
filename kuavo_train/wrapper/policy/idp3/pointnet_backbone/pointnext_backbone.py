@@ -829,8 +829,8 @@ class PointNextEncoder(nn.Module):
 class PointNeXtBackbone(nn.Module):
     """PointNeXt backbone adapter for IDP3.
 
-    Converts IDP3 point-cloud format [B, N, C] into PointNeXt input, then maps
-    PointNeXt global features to IDP3 expected [B, out_channels].
+    Converts IDP3 point-cloud format [B, N, C] into PointNeXt input.
+    This module is single-view only; multi-view merge/split is handled in IDP3Encoder.
     """
 
     def __init__(
@@ -851,6 +851,7 @@ class PointNeXtBackbone(nn.Module):
         pointnext_group_type: str = "ballquery",
         pointnext_query_chunk_size: int = 256,
         pointnext_batch_chunk_size: int = 16,
+        pointnext_gravity_dim: int = 1,
         pointnext_auto_load_pretrained: bool = True,
         pointnext_pretrained_path: str = "dataset/models/pointnext/scanobjectnn-pointnext-s_best.pth",
         pointnext_freeze_backbone: bool = False,
@@ -860,11 +861,12 @@ class PointNeXtBackbone(nn.Module):
         del kwargs
 
         self.pc_channels = pc_channels
-        self.out_channels = out_channels
+        self.requested_out_channels = int(out_channels)
         self.pointnext_in_channels = pointnext_in_channels
         self.pointnext_batch_chunk_size = pointnext_batch_chunk_size
+        self.pointnext_gravity_dim = int(pointnext_gravity_dim)
 
-        # For pc_channels > pointnext_in_channels (e.g. xyzrgb -> 4ch),
+        # For pc_channels > pointnext_in_channels,
         # use direct channel slicing for lower latency and no extra params.
         self.use_channel_slice = self.pc_channels > self.pointnext_in_channels
         if self.pc_channels == self.pointnext_in_channels:
@@ -895,9 +897,13 @@ class PointNeXtBackbone(nn.Module):
             query_chunk_size=pointnext_query_chunk_size,
         )
         encoder_out_channels = self.encoder.out_channels
-        self.output_proj = (
-            nn.Identity() if encoder_out_channels == out_channels else nn.Linear(encoder_out_channels, out_channels)
-        )
+        self.out_channels = int(encoder_out_channels)
+        # Temporarily disable out_channels mapping. Keep these lines for quick re-enable:
+        # self.output_proj = (
+        #     nn.Identity()
+        #     if encoder_out_channels == out_channels
+        #     else nn.Linear(encoder_out_channels, out_channels)
+        # )
 
         if pointnext_auto_load_pretrained:
             self.load_pointnext_pretrained_weights(pointnext_pretrained_path)
@@ -985,20 +991,20 @@ class PointNeXtBackbone(nn.Module):
             raise ValueError(f"Point cloud must be [B, N, C], got {tuple(x.shape)}")
         if x.shape[-1] < 3:
             raise ValueError(f"Point cloud channel must be >= 3 (xyz), got {x.shape[-1]}")
+        if self.pointnext_in_channels != 4:
+            raise ValueError(
+                f"Simplified PointNeXt input path expects pointnext_in_channels=4, got {self.pointnext_in_channels}"
+            )
+        if not 0 <= self.pointnext_gravity_dim < 3:
+            raise ValueError(
+                f"pointnext_gravity_dim must be in [0, 1, 2], got {self.pointnext_gravity_dim}"
+            )
 
+        # Always use xyz only, then append one relative-height channel.
         pos = x[:, :, :3].contiguous()
-        if self.use_channel_slice:
-            # Fast path: for default xyzrgb input and PointNeXt 4-channel setting,
-            # use [x, y, z, mean(r,g,b)] as features.
-            if self.pointnext_in_channels == 4 and x.shape[-1] >= 6:
-                rgb_mean = x[:, :, 3:6].mean(dim=-1, keepdim=True)
-                feat_xyzc = torch.cat([x[:, :, :3], rgb_mean], dim=-1)
-                feat = feat_xyzc.transpose(1, 2).contiguous()
-            else:
-                feat = x[:, :, : self.pointnext_in_channels].transpose(1, 2).contiguous()
-        else:
-            feat = x.transpose(1, 2).contiguous()  # [B, C, N]
-            feat = self.input_adapter(feat)
+        height = pos[:, :, self.pointnext_gravity_dim : self.pointnext_gravity_dim + 1]
+        height = height - height.amin(dim=1, keepdim=True)
+        feat = torch.cat([pos, height], dim=-1).transpose(1, 2).contiguous()
         return pos, feat
 
     def _convert_pointnext_to_idp3_output(self, pointnext_feat: torch.Tensor) -> torch.Tensor:
@@ -1006,7 +1012,9 @@ class PointNeXtBackbone(nn.Module):
             pointnext_feat = torch.max(pointnext_feat, dim=-1, keepdim=False)[0]
         if pointnext_feat.dim() != 2:
             raise ValueError(f"PointNeXt feature must be [B, F], got {tuple(pointnext_feat.shape)}")
-        return self.output_proj(pointnext_feat)
+        # Temporarily disable out_channels mapping. Keep this line for quick re-enable:
+        # return self.output_proj(pointnext_feat)
+        return pointnext_feat
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         pos, feat = self._convert_idp3_to_pointnext_input(x)

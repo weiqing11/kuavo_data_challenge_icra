@@ -159,7 +159,7 @@ class IDP3Encoder(nn.Module):  # noqa: N801
             *create_mlp(self.state_shape[0], output_dim, net_arch, state_mlp_activation_fn)
         )
 
-        logger.debug(f"[DP3Encoder] output dim: {self.n_output_channels}")
+        logger.debug(f"[IDP3Encoder] output dim: {self.n_output_channels}")
 
     def forward(self, observations: Dict) -> torch.Tensor:
         # 处理多视角输入
