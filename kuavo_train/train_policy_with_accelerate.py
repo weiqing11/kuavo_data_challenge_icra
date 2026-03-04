@@ -175,33 +175,50 @@ def sanitize_policy_config(policy):
 
 
 class DeltaActionProcessorStep(ProcessorStep):
-    def __init__(self, action_key="action", state_key="observation.state"):
+    def __init__(self, action_key="action", state_key="state"):
         super().__init__()
         self.action_key = action_key
         self.state_key = state_key
 
     def __call__(self, transition):
-        # 复制字典以符合 ProcessorStep 的规范
+        # 与 AugmentationProcessorStep 一致：先拷贝，再改写
         new_transition = transition.copy()
+
+        # 1) 取 action（兼容 TransitionKey.ACTION 与字符串 key）
+        action = new_transition.get(TransitionKey.ACTION, None)
+        # logger.info(f"action_shape={tuple(action.shape)}")
+
+        # 2) 取 observation dict，再取 state
+        obs_dict = new_transition.get(TransitionKey.OBSERVATION, None)
+
+        state = obs_dict.get(self.state_key, None)
+        # logger.info(f"state_shape={tuple(state.shape)}")
+        if state is None:
+            # 兼容传入 "observation.state" 的情况
+            if self.state_key == "observation.state":
+                state = obs_dict.get("state", None)
+            if state is None:
+                return new_transition
+
+        # logger.info("[DEBUG]use delta")
+        # 3) 计算 delta action: action - state_base
+        action_dim = action.shape[-1]
+        if state.dim() == 3:
+            # [B, T, S] -> 取当前时刻（最后一帧）
+            state_base = state[:, -1, :action_dim]  # [B, A]
+        else:
+            # [B, S]
+            state_base = state[:, :action_dim]      # [B, A]
         
-        if self.action_key in new_transition and self.state_key in new_transition:
-            action = new_transition[self.action_key]  # 形状通常为 [B, chunk, A]
-            state = new_transition[self.state_key]    # 形状通常为 [B, S] 或 [B, seq, S]
-            
-            action_dim = action.shape[-1]
-            
-            # 提取当前状态的基准值 (base state)
-            if state.dim() == 3:
-                # 如果 state 包含时间序列维度，取第一帧（当前时刻）
-                state_base = state[:, -1, :action_dim]  # [B, A]
-            else:
-                state_base = state[:, :action_dim]     # [B, A]
-                
-            # 计算 delta action，利用 unsqueeze(1) 触发广播机制: [B, chunk, A] - [B, 1, A]
-            new_transition[self.action_key] = action - state_base.unsqueeze(1)
-            
+        # logger.info(
+        #         f"[DeltaDebug] applied: action_shape={tuple(action.shape)}, "
+        #         f"state_shape={tuple(state.shape)}, "
+        #         f"delta_action={action[0][0] - state[0][1]}, "
+        #     )
+        
+        new_transition[TransitionKey.ACTION] = action - state_base.unsqueeze(1)
         return new_transition
-        
+
     def transform_features(
         self, features: dict[PipelineFeatureType, dict[str, PolicyFeature]]
     ) -> dict[PipelineFeatureType, dict[str, PolicyFeature]]:
@@ -333,11 +350,8 @@ def main(cfg: DictConfig):
             # 覆盖原有的均值和方差
             dataset_metadata.stats[action_key]["mean"] = torch.tensor(delta_stats["mean"], dtype=torch.float32)
             dataset_metadata.stats[action_key]["std"] = torch.tensor(delta_stats["std"], dtype=torch.float32)
-            
-            # 强制使用 MEAN_STD 归一化（因为我们没有计算 Delta 的 min/max）
-            if hasattr(policy_cfg.output_features[action_key], 'normalization_mode'):
-                policy_cfg.output_features[action_key].normalization_mode = NormalizationMode.MEAN_STD
-                logger.info(f"⚠️ Forced action normalization mode to MEAN_STD for Delta Action.")
+            dataset_metadata.stats[action_key]["min"] = torch.tensor(delta_stats["min"], dtype=torch.float32)
+            dataset_metadata.stats[action_key]["max"] = torch.tensor(delta_stats["max"], dtype=torch.float32)
     # =========================================================================
 
     # Build policy
