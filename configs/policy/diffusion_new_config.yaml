@@ -111,6 +111,7 @@ policy:
 
     # optimizer and scheduler
     optimizer_lr: 0.0001
+    optimizer_backbone_lr: 1.0e-5  # DFormer 全量微调用低学习率，防止预训练特征遗忘
     optimizer_betas: [0.95, 0.999]
     optimizer_eps: 1.0e-08
     optimizer_weight_decay: 1.0e-03

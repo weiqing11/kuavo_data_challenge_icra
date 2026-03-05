@@ -98,8 +98,27 @@ def build_delta_timestamps(dataset_metadata, policy_cfg):
 
 def build_optimizer_and_scheduler(policy, cfg, total_frames, accelerator):
     """Return optimizer and scheduler."""
-    #optimizer = policy.config.get_optimizer_preset().build(policy.parameters())
-    optimizer = policy.config.get_optimizer_preset().build([p for p in policy.parameters() if p.requires_grad])
+    # 差异学习率：DFormer 预训练骨干用低学习率，其余参数用基础学习率
+    backbone_lr = getattr(cfg.policy, "optimizer_backbone_lr", cfg.policy.optimizer_lr)
+    backbone_params, base_params = [], []
+    for name, p in policy.named_parameters():
+        if p.requires_grad:
+            if "dformer_backbone" in name:
+                backbone_params.append(p)
+            else:
+                base_params.append(p)
+    if backbone_params and backbone_lr != cfg.policy.optimizer_lr:
+        logger.info(
+            f"差异学习率：base_params={len(base_params)}个 lr={cfg.policy.optimizer_lr}, "
+            f"dformer_backbone={len(backbone_params)}个 lr={backbone_lr}"
+        )
+        param_groups = [
+            {"params": base_params, "lr": cfg.policy.optimizer_lr},
+            {"params": backbone_params, "lr": backbone_lr},
+        ]
+    else:
+        param_groups = [{"params": base_params + backbone_params, "lr": cfg.policy.optimizer_lr}]
+    optimizer = policy.config.get_optimizer_preset().build(param_groups)
     # If `max_training_step` is specified, it takes precedence; 
     # otherwise, the value is automatically determined based on `max_epoch`.
     if cfg.training.max_training_step is None:
