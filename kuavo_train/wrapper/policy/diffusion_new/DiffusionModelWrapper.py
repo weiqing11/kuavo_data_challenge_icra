@@ -27,7 +27,7 @@ from lerobot.policies.diffusion.modeling_diffusion import (
 )
 from kuavo_train.wrapper.policy.diffusion_new.transformer_diffusion import TransformerForDiffusion
 from kuavo_train.wrapper.policy.diffusion_new.DFormerv2 import DFormerv2_S, DFormerv2_B, DFormerv2_L
-from kuavo_train.wrapper.policy.diffusion_new.DiT_1D_AdaLN import DiT_S
+from kuavo_train.wrapper.policy.diffusion_new.DiT_1D_AdaLN import DiT
 
 # diffusers scheduler classes (factory expects these names)
 from diffusers.schedulers.scheduling_ddim import DDIMScheduler
@@ -1193,24 +1193,43 @@ class CustomDiffusionModelWrapper(DiffusionModel):
             vision_seq_len = num_images * patches_per_img
 
         # =========================================================================
-        # 4. Perceiver Resampler (Token Compression)
+        # 4. Perceiver Resampler (Per-Camera Token Compression)
         # =========================================================================
         self.use_perceiver = getattr(self.config, "use_perceiver", False)
         if self.use_perceiver:
-            perceiver_queries = getattr(self.config, "perceiver_num_queries", 64)
             perceiver_depth = getattr(self.config, "perceiver_depth", 2)
-            
-            self.perceiver = PerceiverResampler(
-                dim=self.cond_feat_dim,          # 必须匹配 DiT/Encoder 的 transformer_n_emb
-                num_queries=perceiver_queries,
-                depth=perceiver_depth,
-                heads=getattr(self.config, "transformer_n_head", 8)
-            )
-            
-            # [关键] 更新序列长度：经过 Resampler 后，Token 数固定为 Queries 数
-            vision_seq_len = perceiver_queries
+            perceiver_heads = getattr(self.config, "transformer_n_head", 8)
+
+            # 每个相机的 queries 数量列表，长度必须等于 num_images
+            queries_per_camera = getattr(self.config, "perceiver_queries_per_camera", None)
+            if queries_per_camera is None:
+                raise ValueError(
+                    "❌ `use_perceiver=True` requires `perceiver_queries_per_camera` "
+                    "(a list of ints, one per camera). e.g. [32, 64, 64]"
+                )
+            if len(queries_per_camera) != num_images:
+                raise ValueError(
+                    f"❌ `perceiver_queries_per_camera` length ({len(queries_per_camera)}) "
+                    f"must match the number of cameras ({num_images})."
+                )
+
+            # 为每个相机创建独立的 PerceiverResampler
+            self.perceivers = nn.ModuleList([
+                PerceiverResampler(
+                    dim=self.cond_feat_dim,
+                    num_queries=q,
+                    depth=perceiver_depth,
+                    heads=perceiver_heads,
+                )
+                for q in queries_per_camera
+            ])
+            self.perceiver_queries_per_camera = list(queries_per_camera)
+
+            # [关键] 更新序列长度：经过各相机 Resampler 后，Token 总数为所有 queries 之和
+            vision_seq_len = sum(queries_per_camera)
         else:
-            self.perceiver = None
+            self.perceivers = None
+            self.perceiver_queries_per_camera = None
 
         # =========================================================================
         # 5. 上下文长度计算 (Context Length Calculation)
@@ -1243,13 +1262,22 @@ class CustomDiffusionModelWrapper(DiffusionModel):
                 n_cond_layers=0,
             )
         elif config.use_dit:
-            # DiT (Diffusion Transformer) 实现
-            self.unet = DiT_S(
+            # DiT (Diffusion Transformer) 实现，规格由 config 控制：
+            # DiT-S: transformer_n_emb=384, transformer_n_head=6,  transformer_n_layer=12
+            # DiT-B: transformer_n_emb=768, transformer_n_head=12, transformer_n_layer=12
+            # image_features 只包含 RGB 摄像头（depth 已由 custom_patches 标记为 FeatureType.DEPTH 并排除）
+            # 因此 len(image_features) 即为实际产生 token 的摄像头数（如 3），不含 depth
+            n_cameras = len(self.config.image_features) if getattr(self.config, "image_features", None) else 1
+            self.unet = DiT(
                 action_dim=config.output_features["action"].shape[0],
                 action_seq_len=config.horizon,
                 n_obs_steps=self.config.n_obs_steps,
                 token_dim=self.cond_feat_dim,
-                max_image_tokens=vision_seq_len      
+                max_image_tokens=vision_seq_len,
+                num_cameras=n_cameras,
+                hidden_size=self.config.transformer_n_emb,
+                depth=self.config.transformer_n_layer,
+                num_heads=self.config.transformer_n_head,
             )
         else:
             raise ValueError("❌ Config Error: Either `use_unet`, `use_transformer` or `use_dit` must be True.")
@@ -1289,7 +1317,7 @@ class CustomDiffusionModelWrapper(DiffusionModel):
             "Obs Steps (S)": self.config.n_obs_steps,
             "Tokens Per Step": f"{vision_seq_len} (Vision)",
             "Total Cond Len": f"{total_cond_len} Tokens",
-            "Perceiver Resampler": f"✅ {self.config.perceiver_num_queries} queries" if self.use_perceiver else "❌ Disabled",
+            "Perceiver Resampler": f"✅ per-cam queries={self.perceiver_queries_per_camera}, total={sum(self.perceiver_queries_per_camera)}" if self.use_perceiver else "❌ Disabled",
             "Action Horizon": f"{self.config.horizon} steps",
             "Noise Scheduler": f"{self.config.noise_scheduler_type} ({self.num_inference_steps} steps)",
         }
@@ -1318,33 +1346,42 @@ class CustomDiffusionModelWrapper(DiffusionModel):
         # 1. RGB Features Processing
         # ---------------------------------------------------------------------
         if getattr(self.config, "image_features", None):
-            
-            # A. 提取特征
+
+            # A. 提取特征，统一为 [B*S*N_cam, P, D]
             if getattr(self.config, "use_separate_rgb_encoder_per_camera", False):
                 # 独立编码器：输入 [N_cam, B*S, C, H, W] -> 输出 list of [B*S, N_patches, D]
                 imgs = einops.rearrange(batch[OBS_IMAGES], "b s n ... -> n (b s) ...")
                 enc_outs = [enc(im) for enc, im in zip(self.rgb_encoder, imgs)]
-                # 拼接所有摄像头的 Patch -> [B*S, N_cam * N_patches, D]
-                vis_tokens = torch.cat(enc_outs, dim=1)
+                # stack -> [B*S, N_cam, N_patches, D] -> [B*S*N_cam, N_patches, D]
+                vis_feats = einops.rearrange(torch.stack(enc_outs, dim=1), "(b s) n p d -> (b s n) p d", b=B, s=S)
             else:
                 # 共享编码器：输入 [B*S*N_cam, C, H, W] -> 输出 [B*S*N_cam, N_patches, D]
                 imgs = einops.rearrange(batch[OBS_IMAGES], "b s n ... -> (b s n) ...")
 
                 depths = None
                 if OBS_DEPTH in batch:
-                    depths = batch[OBS_DEPTH] 
+                    depths = batch[OBS_DEPTH]
                     depths = einops.rearrange(depths, "b s n c h w -> (b s n) c h w")
-                
+
                 vis_feats = self.rgb_encoder(imgs, depths)
+
+            # B. Per-Camera Perceiver 压缩 或 直接拼接
+            if self.use_perceiver:
+                # vis_feats: [B*S*N_cam, P, D] -> [B*S, N_cam, P, D]
+                N_cam = len(self.perceivers)
+                vis_per_cam = einops.rearrange(vis_feats, "(b s n) p d -> (b s) n p d", b=B, s=S, n=N_cam)
+
+                # 对每个相机独立压缩，得到 [B*S, Q_i, D]，再在 token 维度拼接
+                cam_tokens = [
+                    self.perceivers[i](vis_per_cam[:, i, :, :])
+                    for i in range(N_cam)
+                ]
+                # [B*S, sum(Q_i), D]
+                vis_tokens = torch.cat(cam_tokens, dim=1)
+            else:
                 # 重排并拼接 -> [B*S, N_cam * N_patches, D]
                 vis_tokens = einops.rearrange(vis_feats, "(b s n) p d -> (b s) (n p) d", b=B, s=S)
 
-            # B. Perceiver 压缩 (关键步骤)
-            if self.use_perceiver:
-                # Input:  [B*S, Total_Raw_Tokens, D]
-                # Output: [B*S, Num_Queries, D] (例如 64 个)
-                vis_tokens = self.perceiver(vis_tokens)
-                
             # C. 恢复时间维度
             # [B*S, N_tokens, D] -> [B, S, N_tokens, D]
             vis_tokens = einops.rearrange(vis_tokens, "(b s) t d -> b s t d", b=B, s=S)

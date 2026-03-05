@@ -138,15 +138,20 @@ policy:
       use_transformer: False
       use_dit: True
 
+      # DiT 规格选择（修改下方三个参数即可切换）：
+      # DiT-S: transformer_n_emb: 384, transformer_n_head: 6,  transformer_n_layer: 12
+      # DiT-B: transformer_n_emb: 768, transformer_n_head: 12, transformer_n_layer: 12
       transformer_n_emb: 384
-      transformer_n_head: 8
+      transformer_n_head: 6
       transformer_n_layer: 12
       transformer_dropout: 0.1
       ddim_eta: 0.1 # eta for ddim
 
       # === Perceiver Resampler 配置 ===
       use_perceiver: False          # 开启 Token 压缩
-      perceiver_num_queries: 256   # 压缩后的 Token 数量 (建议 32-64)
+      # 每个相机独立的 queries 数量，顺序对应 image_features 中相机的顺序
+      # 例：[head_cam, wrist_cam_l, wrist_cam_r] -> 头部相机压缩更多，腕部保留更多细节
+      perceiver_queries_per_camera: [64, 64, 64]
       perceiver_depth: 2           # Resampler 的层数 (通常 1 或 2 足够)
 
       # === 视觉模型名称与路径 ===

@@ -502,13 +502,30 @@ def main(cfg: DictConfig):
         for batch in epoch_bar:
             batch = preprocessor(batch)
 
-            if accelerator.is_main_process and steps == 0 and cfg.training.get("delta_action", {}).get("enable", False):
-                if "action" in batch and "observation.state" in batch:
-                    logger.info(f"[DeltaCheck] action shape: {tuple(batch['action'].shape)}")
-                    logger.info(f"[DeltaCheck] state shape: {tuple(batch['observation.state'].shape)}")
-                    logger.info(f"[DeltaCheck] action mean after preprocessor: {batch['action'].mean().item():.6f}")
-                else:
-                    logger.warning("[DeltaCheck] Missing keys: 'action' or 'observation.state'")
+            if accelerator.is_main_process and steps == 0:
+                # Delta action 检查
+                if cfg.policy.get("custom", {}).get("delta_action", {}).get("enable", False):
+                    if "action" in batch and "observation.state" in batch:
+                        logger.info(f"[DeltaCheck] action shape: {tuple(batch['action'].shape)}")
+                        logger.info(f"[DeltaCheck] state shape: {tuple(batch['observation.state'].shape)}")
+                        logger.info(f"[DeltaCheck] action mean after preprocessor: {batch['action'].mean().item():.6f}")
+                    else:
+                        logger.warning("[DeltaCheck] Missing keys: 'action' or 'observation.state'")
+                # 深度图数值范围检查（诊断 DFormer 的 depth 归一化是否合理）
+                depth_keys = [k for k in batch if "depth" in k.lower() and isinstance(batch[k], torch.Tensor)]
+                if depth_keys:
+                    for k in depth_keys:
+                        v = batch[k]
+                        logger.info(
+                            f"[DepthCheck] {k}: shape={tuple(v.shape)}, "
+                            f"min={v.min():.4f}, max={v.max():.4f}, mean={v.mean():.4f}"
+                        )
+                    if any(batch[k].max().item() > 10.0 for k in depth_keys):
+                        logger.warning(
+                            "[DepthCheck] depth max > 10.0，疑似原始米制数值未归一化！"
+                            "DFormerv2 内部使用 ImageNet RGB mean/std 对 depth 做归一化，"
+                            "请确认 depth 是否已在数据集制作时归一化到 [0, 1]。"
+                        )
 
             with accelerator.accumulate(policy):
                 # batch = {k: (v.to(device, non_blocking=True) if isinstance(v, torch.Tensor) else v) for k, v in batch.items()}

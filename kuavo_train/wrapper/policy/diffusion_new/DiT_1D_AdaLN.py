@@ -103,6 +103,7 @@ class DiT(nn.Module):
         n_obs_steps: int,       # 观测历史步数 (S)
         token_dim: int,         # global_cond 中 Token 的维度 (D)
         max_image_tokens: int,  # 预估的最大图像 Token 数 (用于 PosEmbed 初始化)
+        num_cameras: int = 1,   # 摄像头数量 (用于 Camera Positional Embedding)
         hidden_size: int = 1152,
         depth: int = 12,
         num_heads: int = 16,
@@ -114,7 +115,8 @@ class DiT(nn.Module):
         self.n_obs_steps = n_obs_steps
         self.token_dim = token_dim
         self.hidden_size = hidden_size
-        
+        self.num_cameras = num_cameras
+
         # 1. Input Projections
         # ----------------------------------------------------------------------
         # Action -> Hidden
@@ -125,18 +127,25 @@ class DiT(nn.Module):
         # 2. Embeddings
         # ----------------------------------------------------------------------
         self.image_step_embed = nn.Parameter(torch.zeros(1, n_obs_steps, 1, hidden_size))
-        # Positional Embedding: 覆盖 (S * Image_Tokens) + Action_Tokens
-        # 我们这里分配一个足够大的 buffer
-        # 注意: 这里的 max_len 需要是 (S * max_img_per_step) + action_seq_len
-        total_max_len = (n_obs_steps * max_image_tokens) + action_seq_len
-        self.pos_embed = nn.Parameter(torch.zeros(1, total_max_len, hidden_size))
-        
+        # Action Positional Embedding: 仅用于 Action tokens，Image 位置信息已由上游编码器提供
+        self.action_pos_embed = nn.Parameter(torch.zeros(1, action_seq_len, hidden_size))
+        # Camera Positional Embedding: 区分来自不同摄像头的 Token
+        # 当 max_image_tokens 能被 num_cameras 整除时启用（非 Perceiver 不均匀 queries 场景）
+        if num_cameras > 1 and max_image_tokens % num_cameras == 0:
+            self.patches_per_cam = max_image_tokens // num_cameras
+            self.camera_embed = nn.Parameter(torch.zeros(1, 1, num_cameras, 1, hidden_size))
+        else:
+            self.patches_per_cam = max_image_tokens
+            self.camera_embed = None
+
         # Timestep Embedder
         self.t_embedder = TimestepEmbedder(hidden_size)
-        
-        # State Embedder (AdaLN): 
-        # 输入维度 = S * token_dim (我们将 S 个 State Token 展平)
-        self.state_embedder = ConditionEmbedder((n_obs_steps + 1) * token_dim, hidden_size)
+
+        # State Embedder (AdaLN):
+        # S==1: 直接用单步 state，输入维度 = token_dim
+        # S >1: 取最后两步的 prev + curr + delta，输入维度固定为 3 * token_dim
+        self.state_input_dim = token_dim if n_obs_steps == 1 else 3 * token_dim
+        self.state_embedder = ConditionEmbedder(self.state_input_dim, hidden_size)
         
         # 3. Transformer Blocks
         # ----------------------------------------------------------------------
@@ -155,7 +164,10 @@ class DiT(nn.Module):
         nn.init.xavier_uniform_(self.cond_proj.weight)
         nn.init.constant_(self.action_proj.bias, 0)
         nn.init.constant_(self.cond_proj.bias, 0)
-        nn.init.normal_(self.pos_embed, std=0.02)
+        nn.init.normal_(self.image_step_embed, std=0.02)
+        nn.init.normal_(self.action_pos_embed, std=0.02)
+        if self.camera_embed is not None:
+            nn.init.normal_(self.camera_embed, std=0.02)
 
         # Init State Embedder
         for layer in self.state_embedder.mlp:
@@ -201,41 +213,45 @@ class DiT(nn.Module):
         # 2. 准备 AdaLN Condition (State + Time)
         # ======================================================================
         if S > 1:
-            state_prev = state_tokens[:, 0, :]
-            state_curr = state_tokens[:, 1, :]
+            # 取最后两步，兼容 n_obs_steps >= 2 的任意值
+            state_prev = state_tokens[:, -2, :]
+            state_curr = state_tokens[:, -1, :]
             state_delta = state_curr - state_prev
-            
-            # 将它们拼接在一起: (B, 3 * D)
+            # (B, 3 * D)
             state_flat = torch.cat([state_prev, state_curr, state_delta], dim=-1)
         else:
             state_flat = state_tokens.reshape(B, -1)
-        
+
         t_emb = self.t_embedder(timestep)        # (B, Hidden)
         s_emb = self.state_embedder(state_flat)  # (B, Hidden)
         c = t_emb + s_emb                        # (B, Hidden) -> AdaLN
-        
+
         # ======================================================================
         # 3. 准备 Transformer Sequence (Image + Action)
         # ======================================================================
         # 3.1 Project: (B, S, T_img, D) -> (B, S, T_img, H)
-        img_emb = self.cond_proj(img_tokens) 
-        
-        # 3.2 [关键] 注入 Explicit Step Info
-        # self.image_step_embed: (1, S, 1, H)
-        # 自动广播到 (B, S, T_img, H)
+        img_emb = self.cond_proj(img_tokens)
+
+        # 3.2 注入摄像头位置编码: 区分不同摄像头的 Token
+        # Token 排列为 [cam0_p0...cam0_pP, cam1_p0...cam1_pP, ...]，因此 reshape 可以正确分组
+        if self.camera_embed is not None:
+            img_emb = img_emb.reshape(B, S, self.num_cameras, self.patches_per_cam, self.hidden_size)
+            img_emb = img_emb + self.camera_embed  # (1, 1, num_cameras, 1, H) 广播
+            img_emb = img_emb.reshape(B, S, -1, self.hidden_size)
+
+        # 3.3 注入时序位置编码 (step embedding)
+        # self.image_step_embed: (1, S, 1, H)，广播到 (B, S, T_img, H)
         img_emb = img_emb + self.image_step_embed
-        
-        # 3.3 Flatten Time Dimension
-        # (B, S, T_img, H) -> (B, S * T_img, H)
+
+        # 3.4 Flatten Time Dimension: (B, S, T_img, H) -> (B, S * T_img, H)
         img_seq = img_emb.reshape(B, -1, self.hidden_size)
-        
-        # 4. Action
-        x_emb = self.action_proj(x)             # (B, T_act, Hidden)
-        
-        # 5. Concat & Pos Embed (Spatial + Temporal combined)
-        h = torch.cat([img_seq, x_emb], dim=1)  # (B, Total_Seq, Hidden)
-        seq_len = h.shape[1]
-        h = h + self.pos_embed[:, :seq_len, :]
+
+        # 4. Action: 投影 + 专属位置编码
+        x_emb = self.action_proj(x)       # (B, T_act, Hidden)
+        x_emb = x_emb + self.action_pos_embed  # 仅 Action tokens 加位置编码
+
+        # 5. Concat: Image 在前，Action 在后
+        h = torch.cat([img_seq, x_emb], dim=1)  # (B, S*T_img + T_act, Hidden)
         
         # ======================================================================
         # 6. Transformer Forward
@@ -261,17 +277,29 @@ def DiT_S(**kwargs):  return DiT(hidden_size=384, depth=12, num_heads=6, **kwarg
 if __name__ == "__main__":
     # Test
     net = DiT_S(
-        action_dim=14, 
-        action_seq_len=16, 
+        action_dim=14,
+        action_seq_len=16,
         n_obs_steps=2,
-        token_dim=512, 
+        token_dim=512,
         max_image_tokens=200
     )
-    # 输入构造
-    x = torch.randn(4, 16, 14)          # Action
-    t = torch.randint(0, 100, (4,))     # Timestep
-    # Cond: 2步, 每步 100个Image + 1个State = 101个Token
-    cond = torch.randn(4, 2, 101, 512)  
-    
+    x = torch.randn(4, 16, 14)          # (B, T_act, action_dim)
+    t = torch.randint(0, 100, (4,))     # (B,)
+    # global_cond: (B, S, T_img + 1, D)，最后一个 token 是 state
+    # state_embedder 输入维度 = 3 * token_dim = 1536（prev + curr + delta）
+    cond = torch.randn(4, 2, 101, 512)
+
     out = net(x, t, cond)
     print("Output shape:", out.shape)   # Should be (4, 16, 14)
+
+    # 验证 n_obs_steps=1 也能正常工作
+    net1 = DiT_S(
+        action_dim=14,
+        action_seq_len=16,
+        n_obs_steps=1,
+        token_dim=512,
+        max_image_tokens=200
+    )
+    cond1 = torch.randn(4, 1, 101, 512)
+    out1 = net1(x, t, cond1)
+    print("Output shape (S=1):", out1.shape)  # Should be (4, 16, 14)
