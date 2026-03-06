@@ -621,11 +621,11 @@ class dformerv2(nn.Module):
         return {"relative_position_bias_table"}
 
     def forward(self, x, x_e):
-        # # === DEBUG: 归一化前的原始状态 ===
+        # === DEBUG: 归一化前的原始状态 ===
         # with torch.no_grad():
         #     print(f"\n{'='*20} Normalization Debug {'='*20}")
-        #     print(f"[Before] RGB x   | Shape: {list(x.shape)} | Mean: {x.mean():.4f} | Std: {x.std():.4f}")
-        #     print(f"[Before] Depth xe | Shape: {list(x_e.shape)} | Mean: {x_e.mean():.4f} | Std: {x_e.std():.4f}")
+        #     print(f"[Before] RGB x   | Shape: {list(x.shape)} | Max: {x.max():.4f} | Min: {x.min():.4f} | Mean: {x.mean():.4f} | Std: {x.std():.4f}")
+        #     print(f"[Before] Depth xe | Shape: {list(x_e.shape)} | Max: {x_e.max():.4f} | Min: {x_e.min():.4f} | Mean: {x_e.mean():.4f} | Std: {x_e.std():.4f}")
         # normalize
         x = (x - self.rgb_mean) / self.rgb_std
         x_e = (x_e - self.rgb_mean) / self.rgb_std

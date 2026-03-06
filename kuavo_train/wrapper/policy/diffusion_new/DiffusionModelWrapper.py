@@ -740,7 +740,7 @@ class SiglipDFormerEncoder(nn.Module):
         # ==================== LoRA 与冻结逻辑 ====================
         self.use_lora = getattr(config, "use_lora", False)
         self.vision_freeze = getattr(config, "vision_freeze", True)
-        
+
         if self.use_lora:
             peft_config = LoraConfig(
                 r=getattr(config, "lora_rank", 16),
@@ -750,15 +750,40 @@ class SiglipDFormerEncoder(nn.Module):
                 bias="none",
             )
             self.siglip = get_peft_model(self.siglip, peft_config)
-            
+
         elif self.vision_freeze:
             for param in self.siglip.parameters():
                 param.requires_grad = False
             self.siglip.eval()
         # =========================================================
-        
+
         # 2. 加载 DFormer
         self.dformer_backbone = DFomerRGBDBackbone(config)
+
+        # ==================== DFormer LoRA 与冻结逻辑 ====================
+        self.dformer_use_lora = getattr(config, "dformer_use_lora", False)
+        self.dformer_freeze = getattr(config, "dformer_freeze", False)
+
+        if self.dformer_use_lora:
+            dformer_peft_config = LoraConfig(
+                r=getattr(config, "dformer_lora_rank", 16),
+                lora_alpha=getattr(config, "dformer_lora_alpha", 32),
+                target_modules=["q_proj", "k_proj", "v_proj", "out_proj"],  # DFormer Attention 模块
+                lora_dropout=getattr(config, "dformer_lora_dropout", 0.05),
+                bias="none",
+            )
+            self.dformer_backbone.backbone = get_peft_model(
+                self.dformer_backbone.backbone,
+                dformer_peft_config
+            )
+            logger.info(f"✅ DFormer LoRA 已启用: rank={dformer_peft_config.r}, alpha={dformer_peft_config.lora_alpha}")
+
+        elif self.dformer_freeze:
+            for param in self.dformer_backbone.parameters():
+                param.requires_grad = False
+            self.dformer_backbone.eval()
+            logger.info("❄️ DFormer 已冻结")
+        # ================================================================
         
         # 3. 维度配置
         target_dim = getattr(config, "transformer_n_emb", 384)

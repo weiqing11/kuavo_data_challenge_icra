@@ -98,27 +98,7 @@ def build_delta_timestamps(dataset_metadata, policy_cfg):
 
 def build_optimizer_and_scheduler(policy, cfg, total_frames, accelerator):
     """Return optimizer and scheduler."""
-    # 差异学习率：DFormer 预训练骨干用低学习率，其余参数用基础学习率
-    backbone_lr = getattr(cfg.policy, "optimizer_backbone_lr", cfg.policy.optimizer_lr)
-    backbone_params, base_params = [], []
-    for name, p in policy.named_parameters():
-        if p.requires_grad:
-            if "dformer_backbone" in name:
-                backbone_params.append(p)
-            else:
-                base_params.append(p)
-    if backbone_params and backbone_lr != cfg.policy.optimizer_lr:
-        logger.info(
-            f"差异学习率：base_params={len(base_params)}个 lr={cfg.policy.optimizer_lr}, "
-            f"dformer_backbone={len(backbone_params)}个 lr={backbone_lr}"
-        )
-        param_groups = [
-            {"params": base_params, "lr": cfg.policy.optimizer_lr},
-            {"params": backbone_params, "lr": backbone_lr},
-        ]
-    else:
-        param_groups = [{"params": base_params + backbone_params, "lr": cfg.policy.optimizer_lr}]
-    optimizer = policy.config.get_optimizer_preset().build(param_groups)
+    optimizer = policy.config.get_optimizer_preset().build([p for p in policy.parameters() if p.requires_grad])
     # If `max_training_step` is specified, it takes precedence; 
     # otherwise, the value is automatically determined based on `max_epoch`.
     if cfg.training.max_training_step is None:
@@ -358,7 +338,7 @@ def main(cfg: DictConfig):
     # [新增]: 加载 Delta Action 的统计参数并替换到 dataset_metadata 中
     # =========================================================================
     if cfg.policy.get("custom", {}).get("delta_action", {}).get("enable", False):
-        stats_path = cfg.training.delta_action.stats_path
+        stats_path = cfg.policy.custom.delta_action.stats_path
         logger.info(f"🔄 Delta Action enabled! Loading stats from {stats_path}")
         
         with open(stats_path, "r") as f:
@@ -375,6 +355,12 @@ def main(cfg: DictConfig):
 
     # Build policy
     policy = build_policy(cfg.policy_name, policy_cfg)
+    # 打印所有参数 key（仅主进程）
+    # if accelerator.is_main_process:
+    #     logger.info("===== Model Parameter Keys (named_parameters) =====")
+    #     for name, _ in policy.named_parameters():
+    #         logger.info(name)
+    #     logger.info("===== End of Model Parameter Keys =====")
     accelerator.wait_for_everyone()
     preprocessor, postprocessor = make_pre_post_processors(policy_cfg, dataset_stats=dataset_metadata.stats)
     if accelerator.is_main_process:
@@ -530,21 +516,6 @@ def main(cfg: DictConfig):
                         logger.info(f"[DeltaCheck] action mean after preprocessor: {batch['action'].mean().item():.6f}")
                     else:
                         logger.warning("[DeltaCheck] Missing keys: 'action' or 'observation.state'")
-                # 深度图数值范围检查（诊断 DFormer 的 depth 归一化是否合理）
-                depth_keys = [k for k in batch if "depth" in k.lower() and isinstance(batch[k], torch.Tensor)]
-                if depth_keys:
-                    for k in depth_keys:
-                        v = batch[k]
-                        logger.info(
-                            f"[DepthCheck] {k}: shape={tuple(v.shape)}, "
-                            f"min={v.min():.4f}, max={v.max():.4f}, mean={v.mean():.4f}"
-                        )
-                    if any(batch[k].max().item() > 10.0 for k in depth_keys):
-                        logger.warning(
-                            "[DepthCheck] depth max > 10.0，疑似原始米制数值未归一化！"
-                            "DFormerv2 内部使用 ImageNet RGB mean/std 对 depth 做归一化，"
-                            "请确认 depth 是否已在数据集制作时归一化到 [0, 1]。"
-                        )
 
             with accelerator.accumulate(policy):
                 # batch = {k: (v.to(device, non_blocking=True) if isinstance(v, torch.Tensor) else v) for k, v in batch.items()}
