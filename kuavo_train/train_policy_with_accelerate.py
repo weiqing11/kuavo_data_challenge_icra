@@ -271,7 +271,72 @@ class AugmentationProcessorStep(ProcessorStep):
             The original dictionary of policy features.
         """
         return features
-    
+
+
+class StateAugmentationProcessorStep(ProcessorStep):
+    """
+    状态增强处理器 - 对state添加噪声，提高模型对state误差的鲁棒性
+
+    原理：
+    - 训练时：state加噪声，模型学习在noisy_state下预测正确的action
+    - 对于delta action：delta = action - noisy_state
+    - 推理时：即使state有误差，模型也能预测正确的delta
+
+    注意：此步骤仅用于训练，不应保存到preprocessor中
+    """
+
+    def __init__(self, config, state_key="observation.state"):
+        super().__init__()
+        self.enable = config.get("enable", False)
+        self.noise_std = config.get("noise_std", 0.01)
+        self.apply_prob = config.get("apply_prob", 0.7)
+        self.state_key = state_key
+
+    def __call__(self, transition):
+        if not self.enable or torch.rand(1).item() > self.apply_prob:
+            return transition
+
+        # 与 DeltaActionProcessorStep 一致：先拷贝，再改写
+        new_transition = transition.copy()
+
+        # 取 observation dict，再取 state（模仿DeltaActionProcessorStep的方式）
+        obs_dict = new_transition.get(TransitionKey.OBSERVATION, None)
+        if obs_dict is None:
+            return new_transition
+
+        state = obs_dict.get(self.state_key, None)
+        if state is None:
+            # 兼容传入 "observation.state" 的情况
+            if self.state_key == "observation.state":
+                state = obs_dict.get("state", None)
+            if state is None:
+                return new_transition
+
+        # 添加高斯噪声
+        noise = torch.randn_like(state) * self.noise_std
+        noisy_state = state + noise
+
+        # 更新state（使用相同的key）
+        obs_dict[self.state_key if self.state_key in obs_dict else "state"] = noisy_state
+        new_transition[TransitionKey.OBSERVATION] = obs_dict
+        return new_transition
+
+    def transform_features(
+        self, features: dict[PipelineFeatureType, dict[str, PolicyFeature]]
+    ) -> dict[PipelineFeatureType, dict[str, PolicyFeature]]:
+        """
+        Returns the input features unchanged.
+
+        State augmentation does not alter the fundamental definition of the features.
+
+        Args:
+            features: A dictionary of policy features.
+
+        Returns:
+            The original dictionary of policy features.
+        """
+        return features
+
 
 def insert_before_normalizer(pipeline, new_step):
     """
@@ -286,6 +351,24 @@ def insert_before_normalizer(pipeline, new_step):
     pipeline.steps.append(new_step)
     logger.info(f"No NormalizerProcessorStep found, appended {new_step.__class__.__name__} at the end")
     return new_step
+
+def insert_before_step(pipeline, new_step, target_step_class):
+    """
+    Insert a processor step before a specific step type.
+    If target step is not found, insert before NormalizerProcessorStep.
+
+    Args:
+        pipeline: The processor pipeline
+        new_step: The step to insert
+        target_step_class: The class type to insert before (e.g., DeltaActionProcessorStep)
+    """
+    for i, step in enumerate(pipeline.steps):
+        if isinstance(step, target_step_class):
+            pipeline.steps.insert(i, new_step)
+            logger.info(f"Inserted {new_step.__class__.__name__} before {target_step_class.__name__} at index {i}")
+            return new_step
+    # If target not found, insert before normalizer
+    return insert_before_normalizer(pipeline, new_step)
 
 def remove_aug_step(pipeline, step_to_remove):
     """
@@ -355,17 +438,17 @@ def main(cfg: DictConfig):
 
     # Build policy
     policy = build_policy(cfg.policy_name, policy_cfg)
-    # 打印所有参数 key（仅主进程）
-    # if accelerator.is_main_process:
-    #     logger.info("===== Model Parameter Keys (named_parameters) =====")
-    #     for name, _ in policy.named_parameters():
-    #         logger.info(name)
-    #     logger.info("===== End of Model Parameter Keys =====")
     accelerator.wait_for_everyone()
+
+    # 创建preprocessor和postprocessor（此时还没有训练专用的增强步骤）
     preprocessor, postprocessor = make_pre_post_processors(policy_cfg, dataset_stats=dataset_metadata.stats)
+
+    # 先保存干净的preprocessor（不包含训练时的增强步骤）
     if accelerator.is_main_process:
         preprocessor.save_pretrained(output_directory)
         postprocessor.save_pretrained(output_directory)
+        logger.info("💾 Saved clean preprocessor and postprocessor (without training augmentation steps)")
+
     # Initialize optimizer and lr scheduler
     optimizer, lr_scheduler = build_optimizer_and_scheduler(policy, cfg, dataset_metadata.info["total_frames"], accelerator)
 
@@ -426,10 +509,23 @@ def main(cfg: DictConfig):
     accelerator.wait_for_everyone()
     # Training loop
     aug_step = insert_before_normalizer(preprocessor, AugmentationProcessorStep(image_transforms, dataset.meta.camera_keys))  # just for training
-    
+
+    # =========================================================================
+    # [新增]: 状态增强 - 提高对state噪声的鲁棒性
+    # 注意：必须在 Delta Action 计算之前插入！
+    # =========================================================================
+    state_aug_step = None
+    if cfg.training.get("State_Augmenter", {}).get("enable", False):
+        state_aug_step = StateAugmentationProcessorStep(cfg.training.State_Augmenter, state_key="observation.state")
+        insert_before_normalizer(preprocessor, state_aug_step)
+        logger.info("✅ Inserted StateAugmentationProcessorStep (will be applied before delta action)")
+    # =========================================================================
+
     # =========================================================================
     # [新增]: 将 Delta Action 转换步骤插入到 normalizer 之前
+    # 注意：Delta Action 计算会使用加噪后的 state
     # =========================================================================
+    delta_step = None
     if cfg.policy.get("custom", {}).get("delta_action", {}).get("enable", False):
         delta_step = DeltaActionProcessorStep(action_key="action", state_key="observation.state")
         insert_before_normalizer(preprocessor, delta_step)
@@ -507,15 +603,15 @@ def main(cfg: DictConfig):
         for batch in epoch_bar:
             batch = preprocessor(batch)
 
-            if accelerator.is_main_process and steps == 0:
-                # Delta action 检查
-                if cfg.policy.get("custom", {}).get("delta_action", {}).get("enable", False):
-                    if "action" in batch and "observation.state" in batch:
-                        logger.info(f"[DeltaCheck] action shape: {tuple(batch['action'].shape)}")
-                        logger.info(f"[DeltaCheck] state shape: {tuple(batch['observation.state'].shape)}")
-                        logger.info(f"[DeltaCheck] action mean after preprocessor: {batch['action'].mean().item():.6f}")
-                    else:
-                        logger.warning("[DeltaCheck] Missing keys: 'action' or 'observation.state'")
+            # if accelerator.is_main_process and steps == 0:
+            #     # Delta action 检查
+            #     if cfg.policy.get("custom", {}).get("delta_action", {}).get("enable", False):
+            #         if "action" in batch and "observation.state" in batch:
+            #             logger.info(f"[DeltaCheck] action shape: {tuple(batch['action'].shape)}")
+            #             logger.info(f"[DeltaCheck] state shape: {tuple(batch['observation.state'].shape)}")
+            #             logger.info(f"[DeltaCheck] action mean after preprocessor: {batch['action'].mean().item():.6f}")
+            #         else:
+            #             logger.warning("[DeltaCheck] Missing keys: 'action' or 'observation.state'")
 
             with accelerator.accumulate(policy):
                 # batch = {k: (v.to(device, non_blocking=True) if isinstance(v, torch.Tensor) else v) for k, v in batch.items()}

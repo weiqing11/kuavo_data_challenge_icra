@@ -27,11 +27,11 @@ training:
     save_freq_epoch: 10  # Training parameter save frequency. 10 epoch per saved weights
     log_freq: 1  # Progress bar refresh frequency. 1 = Every iteration step.
     device: "cuda" # Training device. Single GPU only by default. Systems with multiple GPU's please use CUDA_VISIBLE_DEVICES=6 as an envionment variable. cuda:6 might not work.
-    accumulation_steps: 8  # Grad accumulation step
+    accumulation_steps: 4  # Grad accumulation step
     ema_power: 0.75  # This parameter can be used if the EMA (Equation of Mobility) moving exponential average method is employed.
     # However, current testing shows that using EMA causes performance degradation, so it is no longer supported in the code.
     
-    batch_size: 4  # Batch size. Adjust as needed.
+    batch_size: 8  # Batch size. Adjust as needed.
     num_workers: 8  # dataloader's num_workers. Adjust as needed per your computer's performance. Setting it too high might lock up your computer
     drop_last: False  # Whether to drop the last incomplete batch
 
@@ -59,6 +59,12 @@ training:
         random_border_cutout: { weight: 1.0, type: "RandomBorderCutout", kwargs: {"cut_ratio": 0.15} }
         gaussian_noise: { weight: 1.0, type: "GaussianNoise", kwargs: {"mean": 0.0, "std": 0.1} }
         gamma_correction: { weight: 1.0, type: "GammaCorrection", kwargs: {"gamma": [0.5, 2.0]} }
+
+    # State augmentation for robustness (状态增强，提高对state噪声的鲁棒性)
+    State_Augmenter:
+      enable: True  # 是否启用状态增强
+      noise_std: 0.005  # 噪声标准差（归一化前的值，建议从0.005开始调整）
+      apply_prob: 0.7  # 应用概率（70%的batch会被增强）
 
 
 # =========================================================
@@ -141,8 +147,8 @@ policy:
       # DiT 规格选择（修改下方三个参数即可切换）：
       # DiT-S: transformer_n_emb: 384, transformer_n_head: 6,  transformer_n_layer: 12
       # DiT-B: transformer_n_emb: 768, transformer_n_head: 12, transformer_n_layer: 12
-      transformer_n_emb: 768
-      transformer_n_head: 12
+      transformer_n_emb: 384
+      transformer_n_head: 6
       transformer_n_layer: 12
       transformer_dropout: 0.1
       ddim_eta: 0.1 # eta for ddim
@@ -155,10 +161,10 @@ policy:
       perceiver_depth: 2           # Resampler 的层数 (通常 1 或 2 足够)
 
       # === 视觉模型名称与路径 ===
-      vision_backbone_rgbd: "DFormerv2_base"
+      vision_backbone_rgbd: "DFormerv2_small"
       dino_model_name: "dinov3/facebook:dinov3-vitb16-pretrain-lvd1689m"
       siglip_model_name: "google/siglip2-base-patch16-224"
-      DFormer_path: "/home/liangweiqing/data/models/DFormerv2_pretrained/DFormerv2/pretrained/DFormerv2_Base_pretrained.pth"
+      DFormer_path: "/home/liangweiqing/data/models/DFormerv2_pretrained/DFormerv2/pretrained/DFormerv2_Small_pretrained.pth"
       vision_encoder_mode: patches
 
       # === SigLIP LoRA 配置 ===
