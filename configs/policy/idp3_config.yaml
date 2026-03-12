@@ -29,8 +29,8 @@ training:
 
   max_training_step: null
 
-  resume: false
-  resume_timestamp: ""
+  resume: true
+  resume_timestamp: "run_20260304_212438"
 
   RGB_Augmenter:
     enable: False # 点云不需要用到RGB数据增强

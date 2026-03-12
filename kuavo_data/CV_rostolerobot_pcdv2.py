@@ -170,7 +170,7 @@ def create_empty_dataset(
     for cam in ('h', 'l', 'r'):
         features[f"observation.pc_{cam}"] = {
             "dtype": "float32",
-            "shape": (4096, 6),  # x,y,z,r,g,b
+            "shape": (1024, 6),  # x,y,z,r,g,b
             "names": [
                 "x", "y", "z", "r", "g", "b"
             ],
@@ -405,7 +405,7 @@ def populate_dataset(
                     raise ValueError(f"Unknown camera: {cam}")
                 rgb_img = imgs_per_cam[rgb_key][i]
                 depth_img = imgs_per_cam[depth_key][i]
-                pcd_points = process_pcd_task(rgb_img, depth_img, f"cam_{cam}", task_id=3)
+                pcd_points = process_pcd_task(rgb_img, depth_img, f"cam_{cam}", task_id=3, target_point=1024)
                 frame[f"observation.pc_{cam}"] = pcd_points
 
             for idx, (camera, img_array) in enumerate(imgs_per_cam.items()):

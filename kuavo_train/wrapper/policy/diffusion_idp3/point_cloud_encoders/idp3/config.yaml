@@ -1,0 +1,7 @@
+num_points: 1024
+in_channels: 6
+out_channels: 384
+hidden_dim: 128
+num_layers: 4
+downsample: true
+pretrained_weight_path: ""
