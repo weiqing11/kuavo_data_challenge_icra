@@ -1,4 +1,4 @@
-"""Fusion modules for RGB and point cloud features."""
+"""用于 RGB 与点云特征的基础 FiLM 融合模块。"""
 
 from __future__ import annotations
 
@@ -6,74 +6,106 @@ import torch
 import torch.nn as nn
 
 
-class RgbPointCloudFusion(nn.Module):
-    def __init__(self, token_dim: int, pc_dim: int) -> None:
-        """
-        Purpose:
-            Fuse RGB tokens with point cloud features into a unified token sequence
-            without collapsing RGB patch tokens.
-        Inputs (constructor):
-            token_dim: int, shared token dimension for RGB tokens.
-            pc_dim: int, input dimension of point cloud features per view.
-        Outputs (constructor):
-            None.
-        Forward input shapes:
-            rgb_tokens: [B*S, N_cam, P, token_dim] or None.
-            pc_tokens: [B*S, N_cam, pc_dim] or None.
-        Forward output shape:
-            fused_tokens: [B*S, N_cam, P + 1, token_dim] if both inputs exist,
-                          otherwise returns the available token sequence.
-            Here, P RGB tokens are preserved, and one projected point-cloud token
-            is appended per camera.
-        """
+class Fusion(nn.Module):
+    """
+    在 RGB patch token 与点云视角 token 之间执行基础 FiLM 融合。
+
+    必需输入：
+        rgb_tokens:   [BS, V, P, D]
+        point_tokens: [BS, V, C_pc]
+
+    两种输入都必须提供；任意一个为 None 时会抛出 ValueError。
+
+    融合流程（基础 FiLM）：
+        1) 用点云特征生成 gamma / beta：
+           gamma: [BS, V, D]
+           beta:  [BS, V, D]
+
+        2) 在 patch 维扩展：
+           gamma.unsqueeze(2): [BS, V, 1, D]
+           beta.unsqueeze(2):  [BS, V, 1, D]
+
+        3) 与 RGB token 在 P 维广播计算：
+           fused = (1 + gamma) * rgb + beta
+    """
+
+    def __init__(
+        self,
+        token_dim: int,
+        point_dim: int,
+        hidden_dim: int | None = None,
+    ) -> None:
         super().__init__()
         self.token_dim = token_dim
-        self.pc_dim = pc_dim
+        self.point_dim = point_dim
+        self.hidden_dim = hidden_dim if hidden_dim is not None else max(token_dim, point_dim)
 
-        self.pc_proj = nn.Linear(pc_dim, token_dim)
-        self.fusion_mlp = nn.Sequential(
-            nn.Linear(token_dim * 2, token_dim),
+        self.pc_to_film = nn.Sequential(
+            nn.Linear(point_dim, self.hidden_dim),
             nn.GELU(),
-            nn.Linear(token_dim, token_dim),
+            nn.Linear(self.hidden_dim, token_dim * 2),
         )
 
     def forward(
         self,
         rgb_tokens: torch.Tensor | None,
-        pc_tokens: torch.Tensor | None,
+        point_tokens: torch.Tensor | None,
     ) -> torch.Tensor:
         """
-        Purpose:
-            Produce fused tokens by combining each RGB patch token with point cloud context.
-        Inputs:
-            rgb_tokens: Tensor [B*S, N_cam, P, token_dim] or None.
-            pc_tokens: Tensor [B*S, N_cam, pc_dim] or None.
-        Outputs:
-            fused_tokens: Tensor [B*S, N_cam, P + 1, token_dim] when both inputs exist,
-                          otherwise a passthrough of the available tokens.
+        参数：
+            rgb_tokens:
+                RGB patch token，形状 [BS, V, P, D]
+            point_tokens:
+                点云视角特征，形状 [BS, V, C_pc]
+
+        返回：
+            fused_tokens:
+                [BS, V, P, D]
+
+        异常：
+            ValueError:
+                当 rgb_tokens 或 point_tokens 为 None；
+                或输入张量形状不兼容时抛出。
         """
-        if rgb_tokens is None and pc_tokens is None:
-            raise ValueError("At least one of rgb_tokens or pc_tokens must be provided.")
-        if rgb_tokens is None:
-            # Only point cloud features: return as a single token per view.
-            pc_proj = self.pc_proj(pc_tokens)
-            return pc_proj.unsqueeze(2)
-        if pc_tokens is None:
-            return rgb_tokens
+        # ------------------------------------------------------------------
+        # 严格要求：两种模态必须同时存在
+        # ------------------------------------------------------------------
+        if rgb_tokens is None or point_tokens is None:
+            raise ValueError(
+                "Both rgb_tokens and point_tokens must be provided. "
+                f"Got rgb_tokens is None: {rgb_tokens is None}, "
+                f"point_tokens is None: {point_tokens is None}."
+            )
 
-        # === [FUSION][REVIEW] RGB + PointCloud feature fusion (detail-preserving) ===
-        # Point cloud projection: [B*S, N_cam, token_dim]
-        pc_proj = self.pc_proj(pc_tokens)
+        if rgb_tokens.dim() != 4:
+            raise ValueError(
+                f"rgb_tokens must have shape [BS, V, P, D], but got {tuple(rgb_tokens.shape)}"
+            )
+        if point_tokens.dim() != 3:
+            raise ValueError(
+                f"point_tokens must have shape [BS, V, C_pc], but got {tuple(point_tokens.shape)}"
+            )
 
-        # Broadcast point cloud context to every RGB patch token.
-        # pc_context: [B*S, N_cam, P, token_dim]
-        pc_context = pc_proj.unsqueeze(2).expand(-1, -1, rgb_tokens.shape[2], -1)
+        bs, num_views, num_patches, token_dim = rgb_tokens.shape
+        bs_pc, num_views_pc, point_dim = point_tokens.shape
 
-        # Patch-wise fusion keeps all RGB patch details and injects point cloud info.
-        # rgb_delta / rgb_fused: [B*S, N_cam, P, token_dim]
-        rgb_delta = self.fusion_mlp(torch.cat([rgb_tokens, pc_context], dim=-1))
-        rgb_fused = rgb_tokens + rgb_delta
+        if token_dim != self.token_dim:
+            raise ValueError(
+                f"Expected rgb token dim {self.token_dim}, but got {token_dim}"
+            )
+        if point_dim != self.point_dim:
+            raise ValueError(
+                f"Expected point token dim {self.point_dim}, but got {point_dim}"
+            )
+        if bs != bs_pc or num_views != num_views_pc:
+            raise ValueError(
+                "rgb_tokens and point_tokens must have aligned [BS, V] dimensions, "
+                f"but got rgb {tuple(rgb_tokens.shape)} and point {tuple(point_tokens.shape)}"
+            )
 
-        # Keep P fused RGB tokens and append one projected point cloud token.
-        fused_tokens = torch.cat([rgb_fused, pc_proj.unsqueeze(2)], dim=2)
-        return fused_tokens
+        gamma, beta = self.pc_to_film(point_tokens).chunk(2, dim=-1)  # [BS, V, D], [BS, V, D]
+        gamma = gamma.unsqueeze(2)  # [BS, V, 1, D]
+        beta = beta.unsqueeze(2)    # [BS, V, 1, D]
+
+        # 在 P 维广播执行基础 FiLM，输出 [BS, V, P, D]
+        return (1.0 + gamma) * rgb_tokens + beta

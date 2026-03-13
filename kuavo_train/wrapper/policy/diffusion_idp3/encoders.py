@@ -5,6 +5,7 @@ All functions include explicit purpose and input/output shape annotations.
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Sequence
 
 import torch
@@ -170,11 +171,16 @@ class SiglipRGBEncoder(nn.Module):
         if self.mode != "patches":
             raise ValueError(f"SiglipRGBEncoder only supports 'patches' mode. Got: {self.mode}")
 
-        self.siglip_model_name = config.siglip_model_name
-        is_local = "/" in self.siglip_model_name
-        logger.info(f"Loading SigLIP model: {self.siglip_model_name}")
-        self.siglip = SiglipVisionModel.from_pretrained(self.siglip_model_name, local_files_only=is_local)
-        self.processor = SiglipImageProcessor.from_pretrained(self.siglip_model_name, local_files_only=is_local)
+        self.siglip_model_name = str(config.siglip_model_name)
+        siglip_path = Path(self.siglip_model_name)
+        if not siglip_path.exists():
+            raise FileNotFoundError(
+                "diffusion_idp3 SigLIP must be loaded from a local filesystem path. "
+                f"Path not found: {self.siglip_model_name}"
+            )
+        logger.info(f"Loading SigLIP model from local path: {siglip_path}")
+        self.siglip = SiglipVisionModel.from_pretrained(str(siglip_path), local_files_only=True)
+        self.processor = SiglipImageProcessor.from_pretrained(str(siglip_path), local_files_only=True)
 
         self.use_lora = getattr(config, "use_lora", False)
         self.vision_freeze = getattr(config, "vision_freeze", True)

@@ -217,6 +217,7 @@ ana.py
 *.tar
 error.txt
 obs.png
+dataset
 datasets
 *.mp4
 *.ply

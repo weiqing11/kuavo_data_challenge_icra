@@ -129,7 +129,12 @@ def check_control_signals():
 
 
     
-def setup_policy(pretrained_path, policy_type, device=torch.device("cuda")):
+def setup_policy(
+    pretrained_path,
+    policy_type,
+    device=torch.device("cuda"),
+    initialize_from_pretrained: bool = False,
+):
     """
     Set up and load the policy model.
     
@@ -154,7 +159,11 @@ def setup_policy(pretrained_path, policy_type, device=torch.device("cuda")):
     elif policy_type == 'idp3':
         policy = IDP3Policy.from_pretrained(Path(pretrained_path),strict=True)
     elif policy_type == "diffusion_idp3":
-        policy = DiffusionIDP3PolicyWrapper.from_pretrained(Path(pretrained_path), strict=True)
+        policy = DiffusionIDP3PolicyWrapper.from_pretrained(
+            Path(pretrained_path),
+            strict=True,
+            initialize_from_pretrained=initialize_from_pretrained,
+        )
     else:
         raise ValueError(f"Unsupported policy type: {policy_type}")
     
@@ -167,6 +176,17 @@ def setup_policy(pretrained_path, policy_type, device=torch.device("cuda")):
     log_model.info(f"Model device: {device}")
     
     return policy
+
+
+def _is_delta_action_enabled(policy) -> bool:
+    custom = getattr(policy.config, "custom", {})
+    if isinstance(custom, dict):
+        delta_cfg = custom.get("delta_action", {})
+        if isinstance(delta_cfg, dict):
+            return bool(delta_cfg.get("enable", False))
+        return bool(getattr(delta_cfg, "enable", False))
+    delta_cfg = getattr(custom, "delta_action", None)
+    return bool(getattr(delta_cfg, "enable", False))
 
 def run_single_episode(config, policy, preprocessor, postprocessor, episode, output_directory):
     """运行单个episode Running a single episode"""
@@ -226,11 +246,7 @@ def run_single_episode(config, policy, preprocessor, postprocessor, episode, out
     done = False
 
     # [新增]：从配置中读取是否开启了 delta_action（如果没配置默认 False，兼容旧模型）
-    enable_delta = bool(
-        (policy.config.custom.get("delta_action", {}) if isinstance(policy.config.custom, dict) else policy.config.custom.delta_action).__dict__.get("enable", False)
-        if not isinstance(policy.config.custom, dict)
-        else policy.config.custom.get("delta_action", {}).get("enable", False)
-    )
+    enable_delta = _is_delta_action_enabled(policy)
 
     while not done:
         # --- Pause support: block here if pause_flag is set ---
@@ -381,7 +397,13 @@ def kuavo_eval_autotest(config: KuavoConfig):
     # Setup policy and environment (只加载一次)
     set_seed(seed)
     device = torch.device(cfg.device)
-    policy = setup_policy(pretrained_path, policy_type, device)
+    initialize_from_pretrained = bool(getattr(cfg, "initialize_from_pretrained", False))
+    policy = setup_policy(
+        pretrained_path,
+        policy_type,
+        device,
+        initialize_from_pretrained=initialize_from_pretrained,
+    )
     preprocessor, postprocessor = make_pre_post_processors(None, Path(str(pretrained_path).split("/epoch", 1)[0]))
     
     # first reset

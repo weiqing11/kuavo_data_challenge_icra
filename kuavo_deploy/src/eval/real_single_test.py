@@ -77,7 +77,12 @@ stop_flag = threading.Event()
 pause_flag = threading.Event()
 
 
-def setup_policy(pretrained_path, policy_type, device=torch.device("cuda")):
+def setup_policy(
+    pretrained_path,
+    policy_type,
+    device=torch.device("cuda"),
+    initialize_from_pretrained: bool = False,
+):
     """
     Set up and load the policy model.
     
@@ -100,7 +105,11 @@ def setup_policy(pretrained_path, policy_type, device=torch.device("cuda")):
     elif policy_type == 'idp3':
         policy = IDP3Policy.from_pretrained(Path(pretrained_path), strict=True)
     elif policy_type == "diffusion_idp3":
-        policy = DiffusionIDP3PolicyWrapper.from_pretrained(Path(pretrained_path), strict=True)
+        policy = DiffusionIDP3PolicyWrapper.from_pretrained(
+            Path(pretrained_path),
+            strict=True,
+            initialize_from_pretrained=initialize_from_pretrained,
+        )
     elif policy_type == 'client':
         policy = PolicyClient()
     else:
@@ -115,6 +124,17 @@ def setup_policy(pretrained_path, policy_type, device=torch.device("cuda")):
     log_model.info(f"Model device: {device}")
     
     return policy
+
+
+def _is_delta_action_enabled(policy) -> bool:
+    custom = getattr(policy.config, "custom", {})
+    if isinstance(custom, dict):
+        delta_cfg = custom.get("delta_action", {})
+        if isinstance(delta_cfg, dict):
+            return bool(delta_cfg.get("enable", False))
+        return bool(getattr(delta_cfg, "enable", False))
+    delta_cfg = getattr(custom, "delta_action", None)
+    return bool(getattr(delta_cfg, "enable", False))
 
 def main(config: KuavoConfig, env: gym.Env):
     # load config
@@ -141,7 +161,13 @@ def main(config: KuavoConfig, env: gym.Env):
     # Select your device
     device = torch.device(cfg.device)
 
-    policy = setup_policy(pretrained_path, policy_type, device)
+    initialize_from_pretrained = bool(getattr(cfg, "initialize_from_pretrained", False))
+    policy = setup_policy(
+        pretrained_path,
+        policy_type,
+        device,
+        initialize_from_pretrained=initialize_from_pretrained,
+    )
     # preprocessor = PolicyProcessorPipeline.from_pretrained(pretrained_path, config_filename="policy_preprocessor.json")
     # postprocessor = PolicyProcessorPipeline.from_pretrained(pretrained_path, config_filename="policy_postprocessor.json")
     preprocessor, postprocessor = make_pre_post_processors(None, Path(str(pretrained_path).split("/epoch", 1)[0]))
@@ -173,8 +199,8 @@ def main(config: KuavoConfig, env: gym.Env):
     for episode in tqdm(range(eval_episodes), desc="Evaluating model", unit="episode"):
         # Reset the policy and environments to prepare for rollout
         policy.reset()
-        observation, info = env.reset(seed=episode+start_seed)
-        observation = preprocessor(observation)
+        raw_observation, info = env.reset(seed=episode + start_seed)
+        observation = preprocessor(raw_observation)
         # log_file.write(f"~~~~~~~~~~~~~~~~~~preprocess observation ok!~~~~~~~~~~~~~~~~~~~~~~~~~~\n")
 
         # Prepare to collect every rewards and all the frames of the episode,
@@ -190,6 +216,9 @@ def main(config: KuavoConfig, env: gym.Env):
 
         step = 0
         done = False
+        enable_delta = _is_delta_action_enabled(policy)
+        chunk_anchor_state = None
+
         with tqdm(total=max_episode_steps, desc=f"Episode {episode+1}", unit="step", leave=False) as pbar:
             while not done:
                 # --- Pause support: block here if pause_flag is set ---
@@ -201,10 +230,38 @@ def main(config: KuavoConfig, env: gym.Env):
                     return
                 
                 start_time = time.time()
+
+                if enable_delta and len(policy._queues.get("action", [])) == 0:
+                    raw_state_val = raw_observation["observation.state"]
+                    if isinstance(raw_state_val, torch.Tensor):
+                        chunk_anchor_state = raw_state_val.clone()
+                    else:
+                        chunk_anchor_state = torch.tensor(raw_state_val)
                 
                 with torch.inference_mode():
                     action = policy.select_action(observation)
                 action = postprocessor(action)
+
+                if enable_delta:
+                    if chunk_anchor_state is None:
+                        raise RuntimeError("Delta action is enabled but chunk anchor state is missing.")
+
+                    action_dim = action.shape[-1]
+                    if chunk_anchor_state.dim() == 1:
+                        base_state = chunk_anchor_state[:action_dim].unsqueeze(0)
+                    elif chunk_anchor_state.dim() == 2:
+                        base_state = chunk_anchor_state[-1:, :action_dim]
+                    elif chunk_anchor_state.dim() == 3:
+                        base_state = chunk_anchor_state[:, -1, :action_dim]
+                    else:
+                        raise ValueError(f"Unsupported chunk_anchor_state shape: {tuple(chunk_anchor_state.shape)}")
+
+                    base_state = base_state.to(action.device)
+                    if action.dim() == 3:
+                        action = action + base_state.unsqueeze(1)
+                    else:
+                        action = action + base_state
+
                 action_infer_time = time.time()
                 log_model.debug(f"action infer time: {action_infer_time - start_time:.3f}s")
                 average_action_infer_time += action_infer_time - start_time
@@ -213,8 +270,8 @@ def main(config: KuavoConfig, env: gym.Env):
                 log_model.debug(f"numpy_action: {numpy_action}")
 
                 # 执行动作 Execute action
-                observation, reward, terminated, truncated, info = env.step(numpy_action)
-                observation = preprocessor(observation)
+                raw_observation, reward, terminated, truncated, info = env.step(numpy_action)
+                observation = preprocessor(raw_observation)
                 exec_time = time.time()
                 log_model.debug(f"exec time: {exec_time - action_infer_time:.3f}s")
                 average_exec_time += exec_time - action_infer_time

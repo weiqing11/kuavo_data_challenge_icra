@@ -172,6 +172,9 @@ class ConfigInference:
     })
     point_cloud_method : str = "fps"
     point_cloud_task_id: int = 1
+    # diffusion_idp3: whether to initialize submodules from local pretrained weights
+    # before checkpoint loading. Set False for checkpoint-only inference / resume.
+    initialize_from_pretrained: bool = False
 
     def validate(self):
         if self.policy_type not in ["diffusion", "act", "idp3", "diffusion_idp3"]:

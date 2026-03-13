@@ -89,3 +89,5 @@ inference:
     wrist_cam_r: "depth_r"
   point_cloud_task_id: 1
   point_cloud_method: "fps"
+  # diffusion_idp3: inference should usually be checkpoint-only
+  initialize_from_pretrained: false

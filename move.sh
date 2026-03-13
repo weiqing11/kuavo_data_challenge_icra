@@ -4,13 +4,13 @@ SSH_OPT="ssh -p 3072"
 REMOTE_HOST="agilex@121.48.164.165"
 
 # 更改参数
-MODE=${1:-"2"}
+MODE=${1:-"1"}
 
 case $MODE in
     "1")
         echo "使用配置 [1]: IDP3 (rgb)"
-        SRC="/home/wushihan/data/Codes/kuavo_data_challenge_icra/outputs/train/idp3_3v_pointnext/"
-        DEST="/home/agilex/liangweiqing/kdc/kuavo_data_challenge_icra/outputs/train/idp3_3v_pointnext"
+        SRC="/home/wushihan/data/Codes/kuavo_data_challenge_icra/outputs/train/Task2/diffusion_idp3"
+        DEST="/home/agilex/liangweiqing/kdc/kuavo_data_challenge_icra/outputs/train/Task2"
         ;;
     "2")
         echo "使用配置 [2]: Task2 (baseline)"

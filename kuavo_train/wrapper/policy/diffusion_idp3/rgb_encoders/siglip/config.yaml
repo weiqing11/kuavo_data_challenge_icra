@@ -1,0 +1,10 @@
+pretrained_model_path: "models--google--siglip2-base-patch16-224"
+pretrained_processor_path: "models--google--siglip2-base-patch16-224"
+vision_encoder_mode: "patches"
+target_dim: 384
+image_size: [224, 224]
+use_lora: true
+lora_rank: 16
+lora_alpha: 32
+lora_dropout: 0.05
+vision_freeze: false

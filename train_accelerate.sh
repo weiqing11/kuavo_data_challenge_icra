@@ -7,9 +7,9 @@ set -e
 export PYTHONPATH="${PYTHONPATH}:."
 
 # 配置文件路径变量
-ACCELERATE_CONFIG="configs/accelerate/ac_915.yaml"
+ACCELERATE_CONFIG="configs/accelerate/ac0_7.yaml"
 POLICY_CONFIG_PATH="../configs/policy"
-POLICY_CONFIG_NAME="diffusion_new_config.yaml"
+POLICY_CONFIG_NAME="diffusion_idp3_config.yaml"
 TRAIN_SCRIPT="kuavo_train/train_policy_with_accelerate.py"
 
 echo "Starting training with Accelerate..."

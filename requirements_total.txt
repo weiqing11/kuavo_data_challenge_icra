@@ -317,3 +317,5 @@ deprecated==1.3.1
 -e third_party/lerobot
 -e .
 kuavo-humanoid-sdk==1.2.2
+# Extra dependency required by PTv3 backbone
+spconv-cu118==2.3.8

@@ -17,7 +17,7 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/*
 
 # 安装 Miniforge
-ENV MINIFORGE_URL="https://mirrors.tuna.tsinghua.edu.cn/github-release/conda-forge/miniforge/Release%2025.3.1-0/Miniforge3-25.3.1-0-Linux-x86_64.sh"
+ENV MINIFORGE_URL="https://mirrors.tuna.tsinghua.edu.cn/github-release/conda-forge/miniforge/LatestRelease/Miniforge3-Linux-x86_64.sh"
 RUN curl -L ${MINIFORGE_URL} -o /tmp/miniforge.sh \
     && bash /tmp/miniforge.sh -b -p /opt/conda \
     && rm /tmp/miniforge.sh
@@ -42,8 +42,9 @@ RUN if [ -f "myenv.tar.gz" ]; then \
     /bin/bash -c "\
         source ./myenv/bin/activate && \
         conda-unpack && \
-        pip install -e . && \
-        cd ./third_party/lerobot && pip install -e . && \
+        # Keep editable imports but do not resolve or modify dependencies from packed env.
+        pip install -e . --no-deps && \
+        cd ./third_party/lerobot && pip install -e . --no-deps && \
         conda clean -afy && \
         rm -rf ./myenv/lib/python*/site-packages/*/tests ./myenv/lib/python*/site-packages/*/test ./myenv/pkgs/* \
     "

@@ -8,11 +8,11 @@ hydra:
     dir: ./outputs/train_hydra_save/multirun/${now:%Y%m%d_%H%M%S}
     subdir: ${hydra:job.override_dirname}
 
-task: "diffusion_idp3"
-method: "baseline"
+task: "Task2"
+method: "diffusion_idp3"
 timestamp: ${now:%Y%m%d_%H%M%S}
 repoid: "lerobot/${task}"
-root: "/home/wushihan/data/Codes/kuavo_data_challenge_icra/dataset/kdc_pcd_3view/Task1_3v_fps_4096_6/lerobot"
+root: "/home/wushihan/data/Codes/kuavo_data_challenge_icra/dataset/kdc_data_pcd/Task2/Task2_fps_4096_6/lerobot"
 
 # =========================================================
 # Training
@@ -28,7 +28,7 @@ training:
   ema_power: 0.75
 
   batch_size: 16
-  num_workers: 8
+  num_workers: 16
   drop_last: False
   max_training_step: null
 
@@ -57,7 +57,9 @@ training:
 policy_name: diffusion_idp3
 
 policy:
-  _target_: kuavo_train.wrapper.policy.diffusion_idp3.DiffusionIDP3ConfigWrapper.DiffusionIDP3ConfigWrapper
+  _target_: kuavo_train.wrapper.policy.diffusion_idp3.DiffusionIDP3ConfigWrapper
+
+  # Common diffusion settings
   n_obs_steps: 2
   horizon: 16
   n_action_steps: 8
@@ -68,7 +70,6 @@ policy:
   normalization_mapping:
     VISUAL: { _target_: lerobot.configs.types.NormalizationMode, value: IDENTITY }
     RGB: { _target_: lerobot.configs.types.NormalizationMode, value: IDENTITY }
-    DEPTH: { _target_: lerobot.configs.types.NormalizationMode, value: IDENTITY }
     STATE: { _target_: lerobot.configs.types.NormalizationMode, value: MIN_MAX }
     ACTION: { _target_: lerobot.configs.types.NormalizationMode, value: MIN_MAX }
 
@@ -76,14 +77,6 @@ policy:
   crop_shape: [420, 560]
 
   use_amp: False
-  spatial_softmax_num_keypoints: 64
-  use_separate_rgb_encoder_per_camera: False
-
-  down_dims: [512, 1024, 2048]
-  kernel_size: 5
-  n_groups: 8
-  diffusion_step_embed_dim: 128
-  use_film_scale_modulation: true
 
   noise_scheduler_type: DDPM
   num_train_timesteps: 100
@@ -104,51 +97,36 @@ policy:
   scheduler_warmup_steps: 500
 
   custom:
-    # RGB only (SigLIP) + Point Cloud
-    use_depth: false
-    depth_backbone: resnet18
-    use_separate_depth_encoder_per_camera: False
+    # Common multimodal settings
     resize_shape: [224, 224]
-
-    # state token
     use_state_encoder: true
-    state_feature_dim: 128
-
-    # denoiser (exactly one should be true)
-    use_unet: False
-    use_transformer: False
-    use_dit: True
-
-    transformer_n_emb: 384
-    transformer_n_head: 8
-    transformer_n_layer: 12
-    transformer_dropout: 0.1
-    ddim_eta: 0.1
-
-    # token compression
-    use_perceiver: False
-    perceiver_num_queries: 256
-    perceiver_depth: 2
-
-    # vision backbones + LoRA
-    # SigLIP-only RGB encoder (no DFormer/DINO in this policy)
-    siglip_model_name: "google/siglip2-base-patch16-224"
-    vision_encoder_mode: patches
-    use_lora: True
-    lora_rank: 16
-    lora_alpha: 32
-    lora_dropout: 0.05
-    vision_freeze: False
-    vision_fusion_dim: 256
-    vision_attn_heads: 8
-
-    # point cloud (IDP3-style)
     use_point_cloud: true
-    point_cloud_keys: ["observation.pc_h", "observation.pc_l", "observation.pc_r"]
-    point_cloud_encoder_type: "idp3_multi_stage_pointnet"
-    point_cloud_num_points: 1024
-    point_cloud_in_channels: 6
-    point_cloud_out_channels: 128
-    point_cloud_project_dim: 384
     strict_point_cloud_keys: true
-    point_cloud_downsample: true
+    point_cloud_keys: ["observation.pc_h", "observation.pc_l", "observation.pc_r"]
+    ddim_eta: 0.1
+    # true: first run, load backbone pretrain from dataset/models
+    # false: resume/inference, rely on checkpoint weights
+    initialize_from_pretrained: true
+    pretrained_root: "/home/wushihan/data/Codes/kuavo_data_challenge_icra/dataset/models"
+
+    # RGB encoder
+    rgb_encoder:
+      type: "siglip"
+      config_path: "kuavo_train/wrapper/policy/diffusion_idp3/rgb_encoders/siglip/config.yaml"
+
+    # Point cloud encoder
+    point_cloud_encoder:
+      type: "idp3_multi_stage_pointnet"
+      config_path: "kuavo_train/wrapper/policy/diffusion_idp3/point_cloud_encoders/idp3/config.yaml"
+      overrides:
+        out_channels: 384
+
+    # Action generator
+    action_generator:
+      type: "diffusion_new_dit"
+      config_path: "kuavo_train/wrapper/policy/diffusion_idp3/action_generator/dit/config.yaml"
+
+    # Delta action (default enabled, aligned with diffusion_new training flow)
+    delta_action:
+      enable: true
+      stats_path: "${root}/meta/stats_delta_chunk16.json"

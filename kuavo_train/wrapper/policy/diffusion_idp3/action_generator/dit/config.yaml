@@ -1,0 +1,7 @@
+token_dim: 384
+variant: "DiT_S"
+hidden_size: 384
+depth: 12
+num_heads: 6
+mlp_ratio: 4.0
+pretrained_weight_path: ""
