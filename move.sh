@@ -13,9 +13,9 @@ case $MODE in
         DEST="/home/agilex/liangweiqing/kdc/kuavo_data_challenge_icra/outputs/train/idp3_3v_pointnext"
         ;;
     "2")
-        echo "使用配置 [2]: Task1 (baseline)"
-        SRC="/home/liangweiqing/data/code/kuavo_data_challenge_icra/outputs/train/Task1/siglip_DFormer_S_train_delta"
-        DEST="/home/agilex/liangweiqing/kdc/kuavo_data_challenge_icra/outputs/train/Task1"
+        echo "使用配置 [2]: Task2 (baseline)"
+        SRC="/home/liangweiqing/data/code/kuavo_data_challenge_icra/outputs/train/Task2/siglip_DFormer_S_train_delta"
+        DEST="/home/agilex/liangweiqing/kdc/kuavo_data_challenge_icra/outputs/train/Task2"
         ;;
     *)
         echo "未知模式: $MODE"

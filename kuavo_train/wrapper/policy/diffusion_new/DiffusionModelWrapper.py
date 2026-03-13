@@ -743,9 +743,9 @@ class SiglipDFormerEncoder(nn.Module):
 
         if self.use_lora:
             peft_config = LoraConfig(
-                r=getattr(config, "lora_rank", 16),
-                lora_alpha=getattr(config, "lora_alpha", 32),
-                target_modules=["q_proj", "k_proj", "v_proj", "out_proj", "fc1", "fc2"],
+                r=getattr(config, "lora_rank", 8),
+                lora_alpha=getattr(config, "lora_alpha", 16),
+                target_modules=["q_proj", "k_proj", "v_proj"],
                 lora_dropout=getattr(config, "lora_dropout", 0.05),
                 bias="none",
             )
@@ -766,9 +766,9 @@ class SiglipDFormerEncoder(nn.Module):
 
         if self.dformer_use_lora:
             dformer_peft_config = LoraConfig(
-                r=getattr(config, "dformer_lora_rank", 16),
-                lora_alpha=getattr(config, "dformer_lora_alpha", 32),
-                target_modules=["q_proj", "k_proj", "v_proj", "out_proj"],  # DFormer Attention 模块
+                r=getattr(config, "dformer_lora_rank", 8),
+                lora_alpha=getattr(config, "dformer_lora_alpha", 16),
+                target_modules=["q_proj", "k_proj", "v_proj"],  # DFormer Attention 模块
                 lora_dropout=getattr(config, "dformer_lora_dropout", 0.05),
                 bias="none",
             )

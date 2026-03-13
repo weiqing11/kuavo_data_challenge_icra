@@ -8,11 +8,11 @@ hydra:  # Hydra config directory, for parameter checking only
     dir: ./outputs/train_hydra_save/multirun/${now:%Y%m%d_%H%M%S}  # sweep root dir
     subdir: ${hydra:job.override_dirname}
 
-task: "Task1"  # Custom task name. If using huggingface datasets instead of local dataset...
+task: "Task2"  # Custom task name. If using huggingface datasets instead of local dataset...
 method: "siglip_DFormer_S_train_delta"  # Custom method name
 timestamp: ${now:%Y%m%d_%H%M%S}  # Auto-obtained timestamp
 repoid: "lerobot/${task}"  # Newer versions of lerobot require this, for lerobot reference only.
-root: "/home/liangweiqing/data/code/kuavo_data_challenge_icra/datasets/Task1"  # Locally converted lerobot dataset directory
+root: "/home/liangweiqing/data/code/kuavo_data_challenge_icra/datasets/kdc_icra_26_lerobot_task2"  # Locally converted lerobot dataset directory
 # root: null  # If using huggingface datasets instead of local dataset, please specify in task, such as pusht, aloha_sim_insertion_human.
 # Uncomment and leave that to null in that case. This will then use their cloud downloads
 
@@ -161,23 +161,23 @@ policy:
       perceiver_depth: 2           # Resampler 的层数 (通常 1 或 2 足够)
 
       # === 视觉模型名称与路径 ===
-      vision_backbone_rgbd: "DFormerv2_small"
+      vision_backbone_rgbd: "DFormerv2_base"  # "DFormerv2_large" or "DFormerv2_small". Large for best performance, small for faster training and less GPU memory usage.
       dino_model_name: "dinov3/facebook:dinov3-vitb16-pretrain-lvd1689m"
       siglip_model_name: "google/siglip2-base-patch16-224"
-      DFormer_path: "/home/liangweiqing/data/models/DFormerv2_pretrained/DFormerv2/pretrained/DFormerv2_Small_pretrained.pth"
+      DFormer_path: "/home/liangweiqing/data/models/DFormerv2_pretrained/DFormerv2/pretrained/DFormerv2_Base_pretrained.pth"
       vision_encoder_mode: patches
 
       # === SigLIP LoRA 配置 ===
-      use_lora: True          # 开启 SigLIP LoRA
+      use_lora: False          # 开启 SigLIP LoRA
       lora_rank: 16            # 推荐 8 或 16
       lora_alpha: 32           # 推荐 rank * 2
       lora_dropout: 0.05
-      vision_freeze: False  # 是否冻结 SigLIP 参数
+      vision_freeze: True  # 是否冻结 SigLIP 参数
 
       # === DFormer LoRA 配置 ===
       dformer_use_lora: True   # 开启 DFormer LoRA（推荐，显存友好 + 防遗忘）
-      dformer_lora_rank: 16    # DFormer LoRA rank
-      dformer_lora_alpha: 32   # DFormer LoRA alpha
+      dformer_lora_rank: 8    # DFormer LoRA rank
+      dformer_lora_alpha: 16   # DFormer LoRA alpha
       dformer_lora_dropout: 0.05
       dformer_freeze: False    # 是否完全冻结 DFormer（若启用 LoRA 则此项无效）
 
@@ -186,4 +186,4 @@ policy:
 
       delta_action:
         enable: true
-        stats_path: "/home/liangweiqing/data/code/kuavo_data_challenge_icra/datasets/Task1/meta/stats_delta_chunk16.json"
+        stats_path: "/home/liangweiqing/data/code/kuavo_data_challenge_icra/datasets/kdc_icra_26_lerobot_task2/meta/stats_delta_chunk16.json"
